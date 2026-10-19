@@ -40,6 +40,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.base_scheduler import (
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.base_worker import (
     MooncakeBaseConnectorWorker,
 )
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.continuation.config import WanPDConfig
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import (
     MooncakeConnectorMetadata,
 )
@@ -67,7 +68,9 @@ class MooncakeBaseConnector(KVConnectorBase_V1, SupportsHMA):
 
     @property
     def supports_divergent_local_hybrid_hits(self) -> bool:
-        return True
+        # WAN manifests currently describe one verified common prefix. Keep
+        # divergent per-group checkpoint negotiation for a separate extension.
+        return not self._wan_pd_config.enabled
 
     def __init__(
         self,
@@ -82,6 +85,7 @@ class MooncakeBaseConnector(KVConnectorBase_V1, SupportsHMA):
         self.engine_id: EngineId = vllm_config.kv_transfer_config.engine_id
         self.kv_cache_config = kv_cache_config
         self.kv_transfer_config = vllm_config.kv_transfer_config
+        self._wan_pd_config = WanPDConfig.from_extra_config(self.kv_transfer_config.kv_connector_extra_config)
         self.connector_scheduler: MooncakeBaseConnectorScheduler | None = None
         self.connector_worker: MooncakeBaseConnectorWorker | None = None
 
@@ -189,6 +193,12 @@ class MooncakeBaseConnector(KVConnectorBase_V1, SupportsHMA):
         if self.connector_worker is None:
             return None
         return self.connector_worker.get_kv_connector_stats()
+
+    def get_wan_pd_stats(self) -> dict[str, int]:
+        """Local ownership counters for diagnostics; no device synchronization."""
+        implementation = self.connector_scheduler or self.connector_worker
+        getter = getattr(implementation, "get_wan_pd_stats", None)
+        return getter() if getter is not None else {}
 
     @classmethod
     def build_kv_connector_stats(cls, data: dict[str, Any] | None = None) -> KVConnectorStats:

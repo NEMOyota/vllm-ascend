@@ -24,14 +24,17 @@ from vllm.logger import logger
 from vllm.utils.network_utils import get_ip
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
+    MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
-from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec
+from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec, is_circular_kv_cache_spec
 from vllm_ascend.core.kv_cache_placement import map_kvpp_layers_to_owners
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.continuation.config import WanPDConfig
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import (
     MooncakeConnectorMetadata,
     MooncakeTransferMetadata,
@@ -74,6 +77,7 @@ class MooncakeBaseConnectorWorker:
 
         self.vllm_config = vllm_config
         self.kv_transfer_config = vllm_config.kv_transfer_config
+        self.wan_pd_config = WanPDConfig.from_extra_config(self.kv_transfer_config.kv_connector_extra_config)
         if self.kv_transfer_config.is_kv_consumer == self.kv_transfer_config.is_kv_producer:
             raise ValueError(
                 f"Mooncake worker requires exactly one KV transfer role, got {self.kv_transfer_config.kv_role!r}"
@@ -226,6 +230,8 @@ class MooncakeBaseConnectorWorker:
         block_lens_per_layer: list[list[int]] = []
         block_shapes_per_layer: list[list[tuple[int, ...]]] = []
         block_size_scales_per_layer: list[list[int]] = []
+        state_kinds: list[str] = []
+        state_dtypes: list[list[str]] = []
         configured_layer_names: set[str] = set()
 
         for tensor_config in self.kv_cache_config.kv_cache_tensors:
@@ -267,7 +273,9 @@ class MooncakeBaseConnectorWorker:
                     block_lens.append(page_stride)
                     block_shapes.append(block_shape)
                     block_size_scales.append(block_size_scale)
+                    dtypes = ["packed:" + ",".join(str(cache.dtype) for cache in caches)]
                 else:
+                    dtypes = [str(cache.dtype) for cache in caches]
                     for cache in caches:
                         tensor_num_blocks = cache.shape[0]
                         element_size = cache.element_size()
@@ -293,6 +301,16 @@ class MooncakeBaseConnectorWorker:
                 block_lens_per_layer.append(block_lens)
                 block_shapes_per_layer.append(block_shapes)
                 block_size_scales_per_layer.append(block_size_scales)
+                state_kinds.append(
+                    "mamba"
+                    if isinstance(spec, MambaSpec)
+                    else "circular"
+                    if is_circular_kv_cache_spec(spec)
+                    else "sliding_attention"
+                    if isinstance(spec, (SlidingWindowSpec, SlidingWindowMLASpec))
+                    else "full_attention"
+                )
+                state_dtypes.append(dtypes)
 
         unexpected_layers = kv_caches.keys() - configured_layer_names
         if unexpected_layers:
@@ -300,6 +318,8 @@ class MooncakeBaseConnectorWorker:
 
         register_regions = collect_configured_register_regions(self.kv_cache_config, kv_caches)
         validate_register_region_count(register_regions)
+        if self.wan_pd_config.enabled:
+            global_te.retain_pd_buffer_owner(kv_caches, role="kv")
         global_te.register_buffer(register_regions.ptrs, register_regions.lengths)
 
         transfer_metadata = MooncakeTransferMetadata(
@@ -317,6 +337,8 @@ class MooncakeBaseConnectorWorker:
             block_size_scales=block_size_scales_per_layer,
             local_ip=self.side_channel_host,
             handshake_port=self.handshake_port,
+            state_kinds=state_kinds,
+            state_dtypes=state_dtypes,
         )
         self.transfer_metadata = transfer_metadata
         self.xfer_handshake_metadata = transfer_metadata

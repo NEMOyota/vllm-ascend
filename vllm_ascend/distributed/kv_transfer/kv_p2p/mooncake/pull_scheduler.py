@@ -5,6 +5,7 @@
 import queue
 import threading
 import time
+import uuid
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
@@ -26,6 +27,20 @@ from vllm.v1.request import RequestStatus
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.base_scheduler import (
     MooncakeBaseConnectorScheduler,
 )
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.continuation.commit import SourceLedger
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.continuation.config import WanPDConfig
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.continuation.control import (
+    COMMIT_MSG,
+    BoundedCommitSender,
+    CommitRecord,
+)
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.continuation.manifest import (
+    ContinuationManifest,
+    RequestIdentity,
+    StateComponent,
+    fingerprint,
+    request_identity,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import (
     MooncakeConnectorMetadata,
     MooncakePCPTransferMetadata,
@@ -39,6 +54,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.utils import (
     ensure_zmq_send,
     zmq_ctx,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.cache_namespace import build_cache_namespace
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -67,6 +83,8 @@ class MooncakeSchedulerSendingThread(threading.Thread):
         dcp_size: int,
         use_kv_pp: bool,
         ready_event: threading.Event,
+        source_ledger: SourceLedger | None = None,
+        namespace: str = "",
     ) -> None:
         super().__init__(daemon=True, name="MooncakeSchedulerSendingThread")
         encoder = msgspec.msgpack.Encoder()
@@ -80,7 +98,34 @@ class MooncakeSchedulerSendingThread(threading.Thread):
         self.use_kv_pp = use_kv_pp
         if self.use_kv_pp and self.dcp_size != 1:
             raise ValueError(f"Mooncake KVPP cannot be combined with DCP, got dcp_size={self.dcp_size}")
+        self.source_ledger = source_ledger
+        self.namespace = namespace
+        self.engine_epoch = source_ledger.engine_epoch if source_ledger else ""
         metadata_by_pp_rank = self._merge_metadata_by_pp_rank(metadata)
+        self.metadata_by_pp_rank = metadata_by_pp_rank
+        self.layout_fingerprint = (
+            fingerprint(
+                {
+                    str(pp): {
+                        key: getattr(data, key)
+                        for key in (
+                            "layer_names",
+                            "layer_block_sizes",
+                            "group_indices",
+                            "block_strides",
+                            "block_lens",
+                            "block_shapes",
+                            "block_size_scales",
+                            "state_kinds",
+                            "state_dtypes",
+                        )
+                    }
+                    for pp, data in sorted(metadata_by_pp_rank.items())
+                }
+            )
+            if source_ledger
+            else ""
+        )
         self.encoded_metadata = encoder.encode(
             MooncakeTransferMetadataGroups(
                 engine_id=engine_id,
@@ -92,6 +137,9 @@ class MooncakeSchedulerSendingThread(threading.Thread):
                 tp_size=tp_size,
                 use_kv_pp=self.use_kv_pp,
                 metadata_by_pp_rank=metadata_by_pp_rank,
+                engine_epoch=self.engine_epoch,
+                namespace=namespace,
+                layout_fingerprint=self.layout_fingerprint,
             )
         )
         logger.info(
@@ -234,6 +282,13 @@ class MooncakeSchedulerSendingThread(threading.Thread):
                             worker_metadata.block_shapes[local_layer_index],
                             worker_metadata.block_size_scales[local_layer_index],
                         )
+                        if self.source_ledger is not None:
+                            if not worker_metadata.state_kinds or not worker_metadata.state_dtypes:
+                                raise ValueError("WAN PD requires state kind/dtype metadata on all P workers")
+                            layer_signature += (
+                                worker_metadata.state_kinds[local_layer_index],
+                                worker_metadata.state_dtypes[local_layer_index],
+                            )
                         previous_signature = layer_signature_by_name.get(layer_name)
                         if previous_signature is not None and previous_signature != layer_signature:
                             layer_field_names = (
@@ -243,6 +298,8 @@ class MooncakeSchedulerSendingThread(threading.Thread):
                                 "block_lens",
                                 "block_shapes",
                                 "block_size_scales",
+                                "state_kinds",
+                                "state_dtypes",
                             )
                             mismatched_layer_fields = [
                                 field_name
@@ -308,6 +365,16 @@ class MooncakeSchedulerSendingThread(threading.Thread):
                 block_shapes=block_shapes,
                 block_size_scales=block_size_scales,
                 metadata_by_pcp_rank=metadata_by_pcp_rank,
+                state_kinds=[
+                    layer_source_by_name[name][0].state_kinds[layer_source_by_name[name][1]] for name in layer_names
+                ]
+                if self.source_ledger
+                else [],
+                state_dtypes=[
+                    layer_source_by_name[name][0].state_dtypes[layer_source_by_name[name][1]] for name in layer_names
+                ]
+                if self.source_ledger
+                else [],
             )
         return merged
 
@@ -358,7 +425,18 @@ class MooncakeSchedulerSendingThread(threading.Thread):
                 msg = decoder.decode(payload[0])
                 if msg and msg[0] == GET_META_MSG:
                     sock.send_multipart((identity, b"", self.encoded_metadata))
-                elif msg[0] == DONE_RECVING_MSG and len(msg) == 2:
+                elif msg and msg[0] == COMMIT_MSG and len(msg) == 5 and self.source_ledger is not None:
+                    try:
+                        if type(msg[4]) is not bool:
+                            raise ValueError("Invalid PD commit outcome")
+                        request_id = self.source_ledger.finish(msg[1], msg[2], msg[3], msg[4])
+                        if request_id is not None:
+                            self.finished_requests.put(request_id)
+                        response = ACK_MSG
+                    except ValueError:
+                        response = b"REJECTED"
+                    sock.send_multipart((identity, b"", response))
+                elif msg and msg[0] == DONE_RECVING_MSG and len(msg) == 2 and self.source_ledger is None:
                     self._handle_finished_request(str(msg[1]))
                     sock.send_multipart((identity, b"", ACK_MSG))
                 else:
@@ -383,6 +461,10 @@ class MooncakeSchedulerSendingThread(threading.Thread):
         self.finished_requests.put(request_id)
 
     def _retrieve_expired_requests_locked(self) -> None:
+        if self.source_ledger is not None:
+            # Expiry never proves the remote device has stopped reading P memory.
+            self.source_ledger.stats()
+            return
         current_time = time.time()
         while self.delayed_free_requests:
             request_id = next(iter(self.delayed_free_requests))
@@ -481,6 +563,21 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
         kv_cache_config: "KVCacheConfig",
     ) -> None:
         super().__init__(vllm_config, engine_id, kv_cache_config)
+        self.wan_pd = WanPDConfig.from_extra_config(self.kv_transfer_config.kv_connector_extra_config)
+        self._namespace = ""
+        self._source_ledger: SourceLedger | None = None
+        self._commit_sender: BoundedCommitSender | None = None
+        self._recv_manifests: dict[str, ContinuationManifest] = {}
+        self._hash_block_size = getattr(kv_cache_config, "hash_block_size", None) or 0
+        if self.wan_pd.enabled:
+            self._namespace = fingerprint(
+                {"cache": build_cache_namespace(vllm_config), "deployment": self.wan_pd.cache_namespace}
+            )
+            if self.kv_transfer_config.is_kv_producer:
+                self._source_ledger = SourceLedger(self.wan_pd, uuid.uuid4().hex)
+            else:
+                self._commit_sender = BoundedCommitSender(self.wan_pd, self._send_commit)
+                self._commit_sender.start()
 
         # Requests waiting for the worker to start a READ transfer.
         self._reqs_need_recv: dict[str, tuple[Request, BlockIds, BlockIds, int]] = {}
@@ -492,7 +589,7 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
         self._sending_thread: MooncakeSchedulerSendingThread | None = None
         self._recving_thread: MooncakeSchedulerRecvingThread | None = None
 
-        if self.kv_transfer_config.is_kv_consumer:
+        if self.kv_transfer_config.is_kv_consumer and not self.wan_pd.enabled:
             recving_ready_event = threading.Event()
             self._recving_thread = MooncakeSchedulerRecvingThread(recving_ready_event)
             self._recving_thread.start()
@@ -517,6 +614,8 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
             self.dcp_size,
             self.ascend_config.kvpp_config.size > 1,
             ready_event,
+            self._source_ledger,
+            self._namespace,
         )
         self._sending_thread.start()
         if not ready_event.wait(timeout=10):
@@ -524,7 +623,63 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
         if not self._sending_thread.is_alive():
             raise RuntimeError("Mooncake scheduler sending thread failed to start")
 
-    def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int, bool]:
+    def on_new_request(self, request: "Request") -> None:
+        params = request.kv_transfer_params
+        if self.wan_pd.enabled and params and params.get("do_remote_decode"):
+            # The base class can truncate the P prompt for recurrent state.
+            # Preserve the original input identity before that mutation.
+            try:
+                params["_wan_pd_original_identity"] = self._identity(request).to_wire()
+            except ValueError as exc:
+                # add_request() does not catch connector-hook errors. Decline
+                # this handoff without terminating unrelated queued requests.
+                params["_wan_pd_identity_error"] = str(exc)
+                params["do_remote_decode"] = False
+                logger.warning("Declining PD handoff for %s: %s", request.request_id, exc)
+        super().on_new_request(request)
+
+    def _identity(self, request: "Request") -> RequestIdentity:
+        return request_identity(
+            request, namespace=self._namespace, config=self.wan_pd, hash_block_size=self._hash_block_size
+        )
+
+    def get_wan_pd_stats(self) -> dict[str, int]:
+        if self._source_ledger is not None:
+            return {f"source_{key}": value for key, value in self._source_ledger.stats().items()}
+        if self._commit_sender is not None:
+            return {f"completion_{key}": value for key, value in self._commit_sender.stats().items()}
+        return {}
+
+    @staticmethod
+    def _send_commit(record: CommitRecord) -> None:
+        path = make_zmq_path("tcp", record.host, record.port)
+        # The bounded sender owns socket use; no per-peer socket cache can grow.
+        with zmq.Context() as context:
+            sock = make_zmq_socket(context, path, zmq.REQ, bind=False)
+            try:
+                sock.setsockopt(zmq.SNDTIMEO, 1000)
+                sock.setsockopt(zmq.RCVTIMEO, 1000)
+                ensure_zmq_send(
+                    sock,
+                    msgspec.msgpack.encode(
+                        (COMMIT_MSG, record.epoch, record.attempt_id, record.digest, record.committed)
+                    ),
+                    path,
+                )
+                if ensure_zmq_recv(sock, path) != ACK_MSG:
+                    raise RuntimeError("PD source rejected completion")
+            finally:
+                sock.close(linger=0)
+
+    def _queue_commit(self, request_id: str, remote: tuple[str, int, str], committed: bool) -> None:
+        assert self._commit_sender is not None
+        manifest = self._recv_manifests.pop(request_id)
+        self._commit_sender.enqueue(
+            request_id,
+            CommitRecord(remote[0], remote[1], manifest.engine_epoch, manifest.attempt_id, manifest.digest, committed),
+        )
+
+    def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int | None, bool]:
         """Return prompt tokens that will be loaded from a remote producer."""
         params = request.kv_transfer_params
         logger.debug(
@@ -533,9 +688,50 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
             params,
         )
 
+        if self.wan_pd.enabled and params and params.get("do_remote_decode"):
+            assert self._source_ledger is not None
+            if not self._source_ledger.reserve(request.request_id):
+                return None, False
         if params is not None and params.get("do_remote_prefill"):
-            token_ids = request.prompt_token_ids or []
-            actual = self._state_prefill_token_count(len(token_ids))
+            actual = self._state_prefill_token_count(request.num_prompt_tokens)
+            if self.wan_pd.enabled:
+                assert self._commit_sender is not None
+                if not self._commit_sender.reserve(request.request_id):
+                    return None, False
+                try:
+                    manifest = ContinuationManifest.from_wire(params.get("continuation_manifest"), self.wan_pd)
+                    identity = self._identity(request)
+                    if manifest.transfer_plan_fingerprint != fingerprint(
+                        {
+                            key: params.get(key)
+                            for key in (
+                                "remote_block_ids",
+                                "remote_engine_id",
+                                "remote_request_id",
+                                "remote_num_prompt_tokens",
+                                "remote_host",
+                                "remote_port",
+                            )
+                        }
+                    ):
+                        raise ValueError("PD physical transfer plan does not match publication")
+                    manifest.validate_prefix(identity, prefix_tokens=num_computed_tokens, block_size=self.block_size)
+                    if (
+                        manifest.state_position != actual
+                        or manifest.request_id != params.get("remote_request_id")
+                        or params.get("remote_num_prompt_tokens") != actual
+                    ):
+                        raise ValueError("PD state position or producer request mismatch")
+                    for field in ("remote_block_ids", "remote_engine_id", "remote_host", "remote_port"):
+                        if field not in params:
+                            raise ValueError(f"Missing PD field {field}")
+                except ValueError:
+                    # Keep this failure request-local; never advertise invalid external tokens.
+                    self._commit_sender.cancel_unsubmitted(request.request_id)
+                    params["do_remote_prefill"] = False
+                    logger.exception("Rejected PD continuation for %s; recomputing locally", request.request_id)
+                    return 0, False
+                self._recv_manifests[request.request_id] = manifest
             params["num_computed_tokens"] = num_computed_tokens
             count = max(actual - num_computed_tokens, 0)
             if count > 0:
@@ -568,6 +764,7 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
                 "remote_host",
                 "remote_port",
                 "remote_request_id",
+                "remote_num_prompt_tokens",
             )
             if all(field in params for field in required_remote_fields):
                 remote = (
@@ -584,13 +781,19 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
                     )
                     self._reqs_recv_info[request.request_id] = remote
                 else:
-                    if self._recving_thread is None:
-                        raise RuntimeError("Producer Mooncake scheduler cannot acknowledge a receive request")
-                    self._recving_thread.add_request(*remote)
+                    if self.wan_pd.enabled:
+                        self._queue_commit(request.request_id, remote, True)
+                    else:
+                        if self._recving_thread is None:
+                            raise RuntimeError("Producer Mooncake scheduler cannot acknowledge a receive request")
+                        self._recving_thread.add_request(*remote)
             else:
                 logger.warning("Got invalid KVTransferParams. params=%s.", params)
         else:
             assert num_external_tokens == 0
+            if self._commit_sender is not None:
+                self._commit_sender.cancel_unsubmitted(request.request_id)
+                self._recv_manifests.pop(request.request_id, None)
 
         # Only trigger one transfer for a request.
         params["do_remote_prefill"] = False
@@ -630,15 +833,26 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
             params,
         )
 
+        if self.wan_pd.enabled and params and "_wan_pd_identity_error" in params:
+            return False, {
+                "do_remote_prefill": False,
+                "do_remote_decode": False,
+                "wan_pd_error": params["_wan_pd_identity_error"],
+            }
+
         if (
             params is None
             or not params.get("do_remote_decode")
             or request.status != RequestStatus.FINISHED_LENGTH_CAPPED
         ):
+            if self._source_ledger is not None:
+                self._source_ledger.cancel_unpublished(request.request_id)
+            if self._commit_sender is not None and request.request_id not in self._reqs_recv_info:
+                self._commit_sender.cancel_unsubmitted(request.request_id)
+                self._recv_manifests.pop(request.request_id, None)
             return False, None
 
-        prompt_token_ids = request.prompt_token_ids or []
-        prompt_len = len(prompt_token_ids)
+        prompt_len = request.num_prompt_tokens
         computed_block_ids = self._get_transfer_block_ids(block_ids, prompt_len)
         num_computed_blocks = sum(len(group_block_ids) for group_block_ids in computed_block_ids)
         delay_free_blocks = num_computed_blocks > 0
@@ -652,12 +866,10 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
             self._reqs_need_send[request.request_id] = delay_start_time
             if self._sending_thread is None:
                 raise RuntimeError("Mooncake scheduler metadata has not been initialized")
-            self._sending_thread.add_delayed_request(
-                request.request_id,
-                delay_start_time,
-            )
+            if not self.wan_pd.enabled:
+                self._sending_thread.add_delayed_request(request.request_id, delay_start_time)
 
-        return delay_free_blocks, {
+        transfer_params = {
             "do_remote_prefill": True,
             "do_remote_decode": False,
             "remote_block_ids": computed_block_ids,
@@ -668,6 +880,85 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
             "remote_port": self.side_channel_port,
             "last_token_id": request.output_token_ids[-1],
         }
+        if self.wan_pd.enabled and delay_free_blocks:
+            assert self._source_ledger is not None and self._sending_thread is not None
+            try:
+                manifest = self._make_continuation_manifest(request, transfer_params)
+                transfer_params["continuation_manifest"] = manifest.to_wire(self.wan_pd)
+            except ValueError as exc:
+                # Nothing was published: declining this individual handoff can
+                # safely return its source blocks without disturbing others.
+                self._source_ledger.cancel_unpublished(request.request_id)
+                self._reqs_need_send.pop(request.request_id, None)
+                logger.warning("Declining PD publication for %s: %s", request.request_id, exc)
+                return False, {"do_remote_prefill": False, "do_remote_decode": False, "wan_pd_error": str(exc)}
+            if "wan_pd_input_fingerprint" in params:
+                transfer_params["wan_pd_input_fingerprint"] = params["wan_pd_input_fingerprint"]
+            self._source_ledger.publish(manifest)
+        elif self._source_ledger is not None:
+            self._source_ledger.cancel_unpublished(request.request_id)
+        return delay_free_blocks, transfer_params
+
+    def _make_continuation_manifest(self, request: "Request", transfer_params: dict[str, Any]) -> ContinuationManifest:
+        assert self._source_ledger is not None and self._sending_thread is not None
+        params = request.kv_transfer_params
+        assert params is not None
+        prompt_len = request.num_prompt_tokens
+        identity = RequestIdentity.from_wire(params["_wan_pd_original_identity"], self.wan_pd)
+        components = []
+        for pp_meta in self._sending_thread.metadata_by_pp_rank.values():
+            for layer_index, layer_name in enumerate(pp_meta.layer_names):
+                kind = pp_meta.state_kinds[layer_index]
+                group = pp_meta.group_indices[layer_index]
+                start = 0
+                if kind == "sliding_attention":
+                    windows = [getattr(spec, "sliding_window", prompt_len) for spec in self.group_unique_specs[group]]
+                    start = max(0, prompt_len - max(windows))
+                for tensor_index, (dtype, shape) in enumerate(
+                    zip(pp_meta.state_dtypes[layer_index], pp_meta.block_shapes[layer_index])
+                ):
+                    components.append(
+                        StateComponent(
+                            f"{layer_name}:{tensor_index}",
+                            layer_name,
+                            group,
+                            kind,
+                            dtype,
+                            tuple(shape),
+                            start,
+                            prompt_len,
+                            prompt_len if kind in ("mamba", "circular") else None,
+                        )
+                    )
+        manifest = ContinuationManifest(
+            request_id=request.request_id,
+            attempt_id=uuid.uuid4().hex,
+            engine_epoch=self._source_ledger.engine_epoch,
+            namespace=self._namespace,
+            layout_fingerprint=self._sending_thread.layout_fingerprint,
+            input_fingerprint=identity.input_fingerprint,
+            prompt_tokens=identity.prompt_tokens,
+            state_position=prompt_len,
+            prefix_tokens=0,
+            components=tuple(components),
+            prefix_hashes=identity.prefix_hashes,
+            prefix_reusable=identity.prefix_reusable,
+            prefix_hash_block_size=identity.prefix_hash_block_size,
+            transfer_plan_fingerprint=fingerprint(
+                {
+                    key: transfer_params[key]
+                    for key in (
+                        "remote_block_ids",
+                        "remote_engine_id",
+                        "remote_request_id",
+                        "remote_num_prompt_tokens",
+                        "remote_host",
+                        "remote_port",
+                    )
+                }
+            ),
+        )
+        return manifest
 
     def update_connector_output(
         self,
@@ -677,7 +968,9 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
         # workers. Send one scheduler-to-scheduler ACK for the request.
         for req_id in connector_output.finished_recving or ():
             remote = self._reqs_recv_info.pop(req_id, None)
-            if remote is not None:
+            if remote is not None and self.wan_pd.enabled:
+                self._queue_commit(req_id, remote, req_id not in (connector_output.failed_recving or ()))
+            elif remote is not None:
                 if self._recving_thread is None:
                     raise RuntimeError("Producer Mooncake scheduler received a receive-completion event")
                 self._recving_thread.add_request(*remote)

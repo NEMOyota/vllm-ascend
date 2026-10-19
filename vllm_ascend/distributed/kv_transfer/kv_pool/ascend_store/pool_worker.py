@@ -47,6 +47,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.base impor
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.session_tracker import (
     LayerwiseSessionTracker,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.cache_namespace import build_cache_namespace
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator import AscendStoreCoordinator
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.dspark_prefix_cache import (
     DSparkPrefixCache,
@@ -418,6 +419,7 @@ class KVPoolWorker:
                         partitions[-i] += 1
 
         self.metadata: list[KeyMetadata] = []
+        cache_namespace = build_cache_namespace(vllm_config)
         for group_id in range(self.num_kv_cache_groups):
             # the mamba kv_heads is not same with the full attention, can't share the cache data
             group_tp_rank = self.tp_rank if self.group_uses_align_state[group_id] else self.head_or_tp_rank
@@ -428,6 +430,8 @@ class KVPoolWorker:
                     self.dcp_rank,
                     self.pp_rank,
                     group_id,
+                    cache_namespace=cache_namespace,
+                    block_size=self.grouped_block_size[group_id],
                 )
             )
 

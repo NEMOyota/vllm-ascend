@@ -2,11 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 """Worker-side implementation entry point for Mooncake pull transfers."""
 
+import copy
 import queue
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import Any
+from uuid import uuid4
 
 import msgspec
 import torch
@@ -33,6 +35,10 @@ from vllm_ascend.core.kv_cache_interface import (
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.base_worker import (
     MooncakeBaseConnectorWorker,
 )
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.continuation.config import WanPDConfig
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.continuation.manifest import ContinuationManifest, fingerprint
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.continuation.progress import BoundedReadProgress, TransferRange
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.continuation.staging import StagingPool
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import (
     MooncakeConnectorMetadata,
     MooncakePPTransferMetadata,
@@ -47,6 +53,26 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.utils import (
     group_concurrent_contiguous,
     zmq_ctx,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.cache_namespace import build_cache_namespace
+from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
+from vllm_ascend.distributed.pp_transport.egress_service import EgressClient
+
+
+class _BoundedAddresses(list[int]):
+    """Cap descriptors while the existing address mapper constructs a plan."""
+
+    def __init__(self, limit: int) -> None:
+        super().__init__()
+        self.limit = limit
+
+    def append(self, value: int) -> None:
+        if len(self) >= self.limit:
+            raise ValueError("WAN PD address plan exceeds max_manifest_ranges")
+        super().append(value)
+
+    def extend(self, values: Any) -> None:
+        for value in values:
+            self.append(value)
 
 
 class MooncakePullRecvingThread(threading.Thread):
@@ -78,6 +104,7 @@ class MooncakePullRecvingThread(threading.Thread):
         dcp_size: int,
         device: Any,
         ready_event: threading.Event,
+        staging_pool: StagingPool | None = None,
     ) -> None:
         super().__init__(daemon=True, name="MooncakePullRecvingThread")
         self.engine = engine
@@ -141,6 +168,35 @@ class MooncakePullRecvingThread(threading.Thread):
         self.finished_requests: queue.SimpleQueue[tuple[str, bool]] = queue.SimpleQueue()
         self.invalid_block_ids: set[int] = set()
         self.invalid_block_ids_lock = threading.Lock()
+        self.wan_pd_config = WanPDConfig.from_extra_config(vllm_config.kv_transfer_config.kv_connector_extra_config)
+        self._wan_requests: dict[str, ReqMeta] = {}
+        self._wan_requests_lock = threading.RLock()
+        self._wan_progress: BoundedReadProgress | None = None
+        self._wan_failure: Exception | None = None
+        self._wan_wakeup = threading.Event()
+        if self.wan_pd_config.enabled:
+            self._wan_namespace = fingerprint(
+                {
+                    "cache": build_cache_namespace(vllm_config),
+                    "deployment": self.wan_pd_config.cache_namespace,
+                }
+            )
+            if staging_pool is None:
+                raise RuntimeError("WAN PD requires registered staging buffers")
+            self.staging_pool = staging_pool
+            egress = None
+            if self.wan_pd_config.egress_endpoint:
+                egress = EgressClient(
+                    self.wan_pd_config.egress_endpoint,
+                    f"pd-read-{uuid4().hex}",
+                    timeout_s=min(5.0, self.wan_pd_config.timeout_s),
+                )
+                if self.wan_pd_config.chunk_bytes > min(egress.limits.max_bytes, egress.limits.burst_bytes):
+                    egress.close()
+                    raise ValueError("WAN PD chunk_bytes exceeds shared egress capacity")
+            self._wan_progress = BoundedReadProgress(
+                self.wan_pd_config, engine, staging_pool, self._wan_completed, egress=egress
+            )
         assert self.local_metadata is not None
 
     def add_requests(
@@ -150,17 +206,35 @@ class MooncakePullRecvingThread(threading.Thread):
     ) -> None:
         """Queue requests for one remote engine."""
         if requests:
+            if self._wan_progress is not None:
+                if self._wan_failure is not None:
+                    raise RuntimeError("WAN PD progress failed") from self._wan_failure
+                for request_id, metadata in requests.items():
+                    with self._wan_requests_lock:
+                        if request_id in self._wan_requests:
+                            raise ValueError("WAN PD request already owns a destination allocation")
+                        self._wan_requests[request_id] = metadata
+                        if not self._wan_progress.enqueue(
+                            request_id, lambda rid=request_id, meta=metadata: self._plan_wan_request(rid, meta)
+                        ):
+                            self._wan_completed(request_id, "WAN PD pending capacity exhausted")
+                self._wan_wakeup.set()
+                return
             self.request_queue.put((remote_engine_id, requests))
 
     def get_and_clear_finished_requests(self) -> KVConnectorTransferResults:
         """Drain completion and failure together for each finished request."""
         results = KVConnectorTransferResults()
+        if self._wan_failure is not None:
+            raise RuntimeError("WAN PD device-copy progress failed; worker teardown required") from self._wan_failure
         while True:
             try:
                 request_id, failed = self.finished_requests.get_nowait()
             except queue.Empty:
                 return results
             results.finished_recving.add(request_id)
+            if self._wan_progress is not None:
+                self._wan_progress.retire(request_id)
             if failed:
                 results.failed_recving.add(request_id)
 
@@ -175,6 +249,16 @@ class MooncakePullRecvingThread(threading.Thread):
         """Consume queued requests and invoke the transfer implementation."""
         torch.npu.set_device(self.device)
         self.ready_event.set()
+        if self._wan_progress is not None:
+            try:
+                while True:
+                    self._wan_progress.advance()
+                    self._wan_wakeup.wait(0.002)
+                    self._wan_wakeup.clear()
+            except Exception as exc:
+                self._wan_failure = exc
+                logger.exception("WAN PD progress stopped; preserving all registered staging and KV allocations")
+            return
         while True:
             remote_engine_id, requests = self.request_queue.get()
             failed_request_ids: set[str] = set()
@@ -205,6 +289,195 @@ class MooncakePullRecvingThread(threading.Thread):
                 for request_id in requests:
                     self.finished_requests.put((request_id, request_id in failed_request_ids))
                 self.request_queue.task_done()
+
+    def _wan_completed(self, request_id: str, error: str | None) -> None:
+        with self._wan_requests_lock:
+            metadata = self._wan_requests.pop(request_id)
+        if error is not None:
+            self._mark_request_failed(metadata)
+            logger.error("WAN PD receive failed for request %s: %s", request_id, error)
+        self.finished_requests.put((request_id, error is not None))
+
+    def _plan_wan_request(self, request_id: str, request: ReqMeta) -> list[TransferRange]:
+        """Validate semantic coverage before reusing the existing address mapper."""
+        config = self.wan_pd_config
+        manifest = ContinuationManifest.from_wire(request.continuation_manifest, config)
+        plan_identity = fingerprint(
+            {
+                "remote_block_ids": request.remote_block_ids,
+                "remote_engine_id": request.remote_engine_id,
+                "remote_request_id": request.remote_request_id,
+                "remote_num_prompt_tokens": request.remote_num_prompt_tokens,
+                "remote_host": request.remote_host,
+                "remote_port": request.remote_port,
+            },
+            max_bytes=config.max_manifest_bytes,
+        )
+        if manifest.transfer_plan_fingerprint != plan_identity:
+            raise ValueError("WAN PD request block table or source endpoint changed")
+        if manifest.request_id != request.remote_request_id or manifest.namespace != self._wan_namespace:
+            raise ValueError("WAN PD manifest request/namespace mismatch")
+        if manifest.state_position != request.remote_num_prompt_tokens:
+            raise ValueError("WAN PD manifest state position disagrees with producer request")
+        if not 0 <= request.num_computed_tokens <= manifest.state_position:
+            raise ValueError("WAN PD local prefix exceeds producer state")
+        remote = self._get_remote_metadata(
+            request.remote_engine_id, request.remote_host, request.remote_port, engine_epoch=manifest.engine_epoch
+        )
+        if (remote.engine_epoch, remote.namespace, remote.layout_fingerprint) != (
+            manifest.engine_epoch,
+            manifest.namespace,
+            manifest.layout_fingerprint,
+        ):
+            raise ValueError("WAN PD manifest does not identify the current registered producer layout")
+        if (remote.tp_size, remote.pcp_size, remote.dcp_size) != (self.tp_size, self.pcp_size, self.dcp_size):
+            raise ValueError("WAN PD continuation currently requires equal P/D TP, PCP and DCP sizes")
+        if remote.use_kv_pp:
+            raise ValueError("WAN PD continuation does not yet support KVPP scratch ownership")
+        key = (request.remote_engine_id, manifest.engine_epoch, request.remote_host, request.remote_port)
+        pairs_by_pp = self.remote_layer_index_pairs[key]
+        groups_by_pp = self.remote_tp_rank_groups[key]
+        components = {component.component_id: component for component in manifest.components}
+        matched: set[str] = set()
+        trimmed_groups: dict[int, tuple[list[int], list[int]]] = {}
+        for pp_rank, pairs in pairs_by_pp.items():
+            pp = remote.metadata_by_pp_rank[pp_rank]
+            for local_index, remote_index in pairs:
+                layer = self.layer_names[local_index]
+                fields = (
+                    "layer_block_sizes",
+                    "group_indices",
+                    "block_strides",
+                    "block_lens",
+                    "block_shapes",
+                    "block_size_scales",
+                    "state_kinds",
+                    "state_dtypes",
+                )
+                for field_name in fields:
+                    if getattr(self.local_metadata, field_name)[local_index] != getattr(pp, field_name)[remote_index]:
+                        raise ValueError(f"WAN PD incompatible {field_name} for layer {layer}")
+                group = self.group_indices[local_index]
+                if group >= len(request.remote_block_ids) or group >= len(request.local_full_block_ids):
+                    raise ValueError("WAN PD block tables are missing a state group")
+                for table, count in (
+                    (request.remote_block_ids[group], pp.num_blocks),
+                    (request.local_full_block_ids[group], self.local_metadata.num_blocks),
+                ):
+                    if any(type(block) is not int or not 0 <= block < count for block in table):
+                        raise ValueError("WAN PD block ID is outside its registered allocation")
+                kind = self.local_metadata.state_kinds[local_index]
+                local_blocks = request.local_block_ids[group]
+                remote_blocks = request.remote_block_ids[group]
+                full_blocks = request.local_full_block_ids[group]
+                if kind in ("mamba", "circular"):
+                    if not remote_blocks or len(local_blocks) <= (
+                        self.num_speculative_tokens if kind == "mamba" else 0
+                    ):
+                        raise ValueError("WAN PD request is missing a hybrid checkpoint block")
+                    state_index = -self.num_speculative_tokens - 1 if kind == "mamba" else 0
+                    if local_blocks[state_index] == 0 or remote_blocks[-1] == 0:
+                        raise ValueError("WAN PD hybrid checkpoint references an evicted block")
+                else:
+                    spec = self.kv_cache_specs[self.spec_indices[local_index]]
+                    cp_size = (
+                        self._get_full_attention_dcp_sizes(
+                            spec, local_index, remote_index, pp, remote.pcp_size, remote.dcp_size
+                        )[0]
+                        if kind == "full_attention"
+                        else 1
+                    )
+                    block_tokens = self.layer_block_sizes[local_index] * cp_size
+                    required = (manifest.state_position + block_tokens - 1) // block_tokens
+                    start = len(full_blocks) - len(local_blocks)
+                    unhashed_start = start
+                    if kind == "sliding_attention":
+                        component = components.get(f"{layer}:0")
+                        if component is not None:
+                            start = max(start, component.token_start // block_tokens)
+                    if kind == "full_attention" and start != request.num_computed_tokens // block_tokens:
+                        raise ValueError("WAN PD requires aligned per-group attention prefix hits")
+                    if not 0 <= start <= required or len(remote_blocks) < required or len(full_blocks) < required:
+                        raise ValueError("WAN PD block tables do not cover the manifest")
+                    needed = required - start
+                    local_suffix = local_blocks[start - unhashed_start : start - unhashed_start + needed]
+                    if len(local_suffix) < needed or any(
+                        block == 0 for block in (*local_suffix, *remote_blocks[start:required])
+                    ):
+                        raise ValueError("WAN PD state coverage contains missing source or destination blocks")
+                    trimmed = (list(local_suffix), list(full_blocks[:required]))
+                    previous = trimmed_groups.setdefault(group, trimmed)
+                    if previous != trimmed:
+                        raise ValueError("WAN PD mixed cache group has incompatible logical block coverage")
+                for tensor_index, shape in enumerate(self.block_shapes[local_index]):
+                    component_id = f"{layer}:{tensor_index}"
+                    if component_id in matched:
+                        raise ValueError("WAN PD producer publishes duplicate PP ownership for a state component")
+                    component = components.get(component_id)
+                    if component is None or (
+                        component.layer_name,
+                        component.cache_group,
+                        component.kind,
+                        component.dtype,
+                        component.shape,
+                    ) != (
+                        layer,
+                        group,
+                        kind,
+                        self.local_metadata.state_dtypes[local_index][tensor_index],
+                        tuple(shape),
+                    ):
+                        raise ValueError(f"WAN PD manifest is missing or mismatches component {component_id}")
+                    if component.token_end != manifest.state_position or (
+                        kind in ("mamba", "circular") and component.checkpoint_token != manifest.state_position
+                    ):
+                        raise ValueError("WAN PD hybrid state does not share one continuation boundary")
+                    matched.add(component_id)
+        required_local = {
+            f"{layer}:{index}"
+            for li, layer in enumerate(self.layer_names)
+            for index in range(len(self.block_shapes[li]))
+        }
+        if matched != required_local:
+            raise ValueError("WAN PD producer manifest does not cover every local state component")
+        request = copy.copy(request)
+        request.local_block_ids = tuple(
+            trimmed_groups.get(group, (blocks, ()))[0] for group, blocks in enumerate(request.local_block_ids)
+        )
+        request.local_full_block_ids = tuple(
+            trimmed_groups.get(group, ((), blocks))[1] for group, blocks in enumerate(request.local_full_block_ids)
+        )
+        ranges: list[TransferRange] = []
+        block_cache: dict = {}
+        for pp_rank, pairs in pairs_by_pp.items():
+            pp = remote.metadata_by_pp_rank[pp_rank]
+            buckets, _ = self._build_transfer_block_buckets(
+                pp, pairs, groups_by_pp[pp_rank], remote.pcp_size, remote.dcp_size, {request_id: request}, block_cache
+            )
+            for (pcp_rank, tp_rank), entries in buckets.items():
+                local = _BoundedAddresses(config.max_manifest_ranges - len(ranges))
+                source = _BoundedAddresses(config.max_manifest_ranges - len(ranges))
+                sizes = _BoundedAddresses(config.max_manifest_ranges - len(ranges))
+                for spec_index, layers in entries.items():
+                    self._append_spec_transfer_addresses(
+                        spec_index=spec_index,
+                        remote_pcp_rank=pcp_rank,
+                        remote_tp_rank=tp_rank,
+                        remote_pcp_size=remote.pcp_size,
+                        remote_tp_size=remote.tp_size,
+                        remote_dcp_size=remote.dcp_size,
+                        transfer_entries_by_layer=layers,
+                        remote_metadata=pp,
+                        src_list=local,
+                        dst_list=source,
+                        length_list=sizes,
+                    )
+                endpoint = pp.metadata_by_pcp_rank[pcp_rank].metadata_by_tp_rank[tp_rank]
+                peer = f"{endpoint.local_ip}:{endpoint.te_rpc_port}"
+                for destination, address, size in zip(local, source, sizes, strict=True):
+                    self.staging_pool.destination(destination, size)
+                    ranges.append(TransferRange(peer, address, destination, size))
+        return ranges
 
     def _mark_request_failed(self, request_metadata: ReqMeta) -> None:
         if not self.can_report_invalid_block_ids:
@@ -1491,8 +1764,12 @@ class MooncakePullRecvingThread(threading.Thread):
         remote_engine_id: str,
         remote_host: str,
         remote_port: int,
+        engine_epoch: str | None = None,
     ) -> MooncakeTransferMetadataGroups:
-        cached_metadata = self.remote_metadata.get(remote_engine_id)
+        cache_key = (
+            remote_engine_id if engine_epoch is None else (remote_engine_id, engine_epoch, remote_host, remote_port)
+        )
+        cached_metadata = self.remote_metadata.get(cache_key)
         if cached_metadata is not None:
             return cached_metadata
 
@@ -1514,10 +1791,12 @@ class MooncakePullRecvingThread(threading.Thread):
 
         transfer_metadata = self.decoder.decode(metadata_bytes)
         self._validate_remote_metadata(transfer_metadata, remote_engine_id)
+        if engine_epoch is not None and transfer_metadata.engine_epoch != engine_epoch:
+            raise ValueError("WAN PD producer registration epoch changed")
         remote_tp_rank_groups, remote_layer_index_pairs = self._build_remote_transfer_layout(transfer_metadata)
-        self.remote_metadata[remote_engine_id] = transfer_metadata
-        self.remote_tp_rank_groups[remote_engine_id] = remote_tp_rank_groups
-        self.remote_layer_index_pairs[remote_engine_id] = remote_layer_index_pairs
+        self.remote_metadata[cache_key] = transfer_metadata
+        self.remote_tp_rank_groups[cache_key] = remote_tp_rank_groups
+        self.remote_layer_index_pairs[cache_key] = remote_layer_index_pairs
         logger.debug(
             "Mooncake remote transfer layout for engine %s: TP candidates=%s, layer index pairs=%s",
             remote_engine_id,
@@ -1538,6 +1817,7 @@ class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
     ) -> None:
         super().__init__(vllm_config, engine_id, kv_cache_config)
         self._recving_thread: MooncakePullRecvingThread | None = None
+        self._wan_staging_pool: StagingPool | None = None
 
     def register_kv_caches(
         self,
@@ -1546,6 +1826,14 @@ class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
         """Register caches and start the D-side pull execution thread."""
         super().register_kv_caches(kv_caches)
         if self.kv_transfer_config.is_kv_consumer:
+            if self.wan_pd_config.enabled:
+                if not callable(getattr(self.engine, "batch_transfer_async_read_ticket", None)):
+                    raise RuntimeError("WAN PD requires Mooncake managed asynchronous READ tickets")
+                self._wan_staging_pool = StagingPool(
+                    self.wan_pd_config, kv_caches, device=torch.device("npu", torch.npu.current_device())
+                )
+                global_te.retain_pd_buffer_owner(self._wan_staging_pool, role="staging")
+                self._wan_staging_pool.register(self.engine)
             if not isinstance(self.xfer_handshake_metadata, MooncakeTransferMetadata):
                 raise RuntimeError("Mooncake KV caches were registered without transfer metadata")
             ready_event = threading.Event()
@@ -1569,6 +1857,7 @@ class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
                 dcp_size=self.dcp_size,
                 device=torch.npu.current_device(),
                 ready_event=ready_event,
+                staging_pool=self._wan_staging_pool,
             )
             self._recving_thread.start()
             if not ready_event.wait(timeout=10):
@@ -1603,6 +1892,12 @@ class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
         if self._recving_thread is None:
             return set()
         return self._recving_thread.get_and_clear_invalid_block_ids()
+
+    def get_wan_pd_stats(self) -> dict[str, int]:
+        """Expose bounded progress counters through the connector facade."""
+        if self._recving_thread is None or self._recving_thread._wan_progress is None:
+            return {}
+        return self._recving_thread._wan_progress.stats()
 
 
 __all__ = [

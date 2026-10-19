@@ -22,6 +22,7 @@ class TestBoundLayerwiseKeys(unittest.TestCase):
         return SimpleNamespace(
             parallel_config=SimpleNamespace(pipeline_parallel_size=pp_size, tensor_parallel_size=2, rank=0),
             model_config=SimpleNamespace(
+                model="company/model",
                 get_layers_start_end_indices=lambda p: ((0, 3), (3, 7))[p.rank // 2],
                 get_total_num_hidden_layers=lambda: 7,
                 compute_hash=lambda: "model-config",
@@ -58,7 +59,9 @@ class TestBoundLayerwiseKeys(unittest.TestCase):
                             grouped_block_size=sizes,
                         )
                         namespace = mooncake_layerwise.layerwise_topology_namespace(config, cache)
-                        layout = mooncake_layerwise.hybrid_layout_id(cache, 2, namespace=namespace)
+                        layout = mooncake_layerwise.hybrid_layout_id(
+                            cache, 2, namespace=namespace, projected_groups=pp_size > 1
+                        )
                         for group in range(num_groups):
                             expected = []
                             for stage in range(pp_size):
@@ -74,7 +77,7 @@ class TestBoundLayerwiseKeys(unittest.TestCase):
                                             f"@group:{group}@block:{sizes[group]}@hash@{head}"
                                         )
                                     else:
-                                        stage_tag = f"@{namespace}@pp_rank:{stage}" if pp_size > 1 else ""
+                                        stage_tag = f"@{namespace}@block_size:{sizes[group]}@pp_rank:{stage}"
                                         key = f"model{stage_tag}@hash@{head}"
                                     expected.append(key)
                                     self.assertEqual(builder.make_full_key(group, "hash", head, stage), key)

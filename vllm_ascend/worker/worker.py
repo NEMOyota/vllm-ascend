@@ -595,6 +595,19 @@ class NPUWorker(WorkerBase):
         transport = getattr(self, "_wan_pp_transport", None)
         return transport.reserved_memory_bytes if transport is not None else 0
 
+    def _wan_pd_reserved_memory_bytes(self) -> int:
+        # The consumer staging pool is allocated when KV caches are registered,
+        # after profiling. Reserve its device memory before sizing those caches.
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.continuation.config import WanPDConfig
+
+        transfer = self.vllm_config.kv_transfer_config
+        if transfer is None or not transfer.is_kv_consumer:
+            return 0
+        if transfer.kv_connector not in ("MooncakeConnectorV2", "MooncakePullConnector"):
+            return 0
+        config = WanPDConfig.from_extra_config(transfer.kv_connector_extra_config)
+        return config.staging_slots * config.chunk_bytes if config.enabled else 0
+
     def get_wan_pp_stats(self) -> dict[str, int | float | bool]:
         """Per-rank transport counters, available through executor collective RPC."""
         transport = getattr(self, "_wan_pp_transport", None)
@@ -657,6 +670,7 @@ class NPUWorker(WorkerBase):
             + profile_result.torch_peak_increase
             + profile_result.weights_memory
             + self._wan_pp_reserved_memory_bytes()
+            + self._wan_pd_reserved_memory_bytes()
         )
 
         # Save per-category memory for use in compile_or_warm_up_model() (step 5).
@@ -969,6 +983,7 @@ class NPUWorker(WorkerBase):
                 + self.non_torch_memory
                 + npugraph_memory_bytes
                 + self._wan_pp_reserved_memory_bytes()
+                + self._wan_pd_reserved_memory_bytes()
             )
             self.npugraph_memory_bytes = npugraph_memory_bytes
             suggested_to_requested = int(self.requested_memory) - non_kv_memory - redundancy_buffer

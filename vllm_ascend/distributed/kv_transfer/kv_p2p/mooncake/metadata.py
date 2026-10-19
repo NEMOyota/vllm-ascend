@@ -3,7 +3,7 @@
 """Metadata types for Mooncake KV transfer connectors."""
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
@@ -35,6 +35,8 @@ class MooncakeTransferMetadata(KVConnectorHandshakeMetadata):
     block_size_scales: list[list[int]]
     local_ip: str = ""
     handshake_port: int = 0
+    state_kinds: list[str] = field(default_factory=list)
+    state_dtypes: list[list[str]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         num_layers = len(self.layer_names)
@@ -105,6 +107,8 @@ class MooncakePPTransferMetadata:
     block_shapes: list[list[tuple[int, ...]]]
     block_size_scales: list[list[int]]
     metadata_by_pcp_rank: dict[int, MooncakePCPTransferMetadata]
+    state_kinds: list[str] = field(default_factory=list)
+    state_dtypes: list[list[str]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -120,6 +124,9 @@ class MooncakeTransferMetadataGroups:
     tp_size: int
     use_kv_pp: bool
     metadata_by_pp_rank: dict[int, MooncakePPTransferMetadata]
+    engine_epoch: str = ""
+    namespace: str = ""
+    layout_fingerprint: str = ""
 
 
 @dataclass
@@ -137,6 +144,7 @@ class ReqMeta:
     remote_request_id: str
     remote_num_prompt_tokens: int
     local_full_block_ids: BlockIds
+    continuation_manifest: dict[str, Any] | None = None
 
 
 class MooncakeConnectorMetadata(KVConnectorMetadata):
@@ -168,6 +176,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
             remote_request_id=kv_transfer_params["remote_request_id"],
             remote_num_prompt_tokens=kv_transfer_params["remote_num_prompt_tokens"],
             local_full_block_ids=local_full_block_ids or tuple(),
+            continuation_manifest=kv_transfer_params.get("continuation_manifest"),
         )
 
 

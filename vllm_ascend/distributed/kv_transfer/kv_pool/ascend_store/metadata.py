@@ -130,6 +130,15 @@ class KeyMetadata:
     cache_role: str = "kv"
     """ Family name for compress-aware hybrid cache layouts """
     cache_family: str = "default"
+    """Shared model/config identity, independent of local cache allocation."""
+    cache_namespace: str = ""
+    """Resolved logical page size for this group (not scheduler block size)."""
+    block_size: int = 0
+
+    def model_key(self) -> str:
+        if not self.cache_namespace:
+            return self.model_name
+        return f"{self.model_name}@{self.cache_namespace}@block_size:{self.block_size}"
 
 
 @dataclass(order=True)
@@ -147,13 +156,15 @@ class PoolKey:
                 self.key_metadata.kv_cache_group_id,
                 self.key_metadata.cache_role,
                 self.key_metadata.cache_family,
+                self.key_metadata.cache_namespace,
+                self.key_metadata.block_size,
                 self.chunk_hash,
             )
         )
 
     def to_string(self):
         return (
-            f"{self.key_metadata.model_name}"
+            f"{self.key_metadata.model_key()}"
             f"@dcp:{self.key_metadata.dcp_rank}"
             f"@head_or_tp_rank:{self.key_metadata.head_or_tp_rank}"
             f"@pp_rank:{self.key_metadata.pp_rank}"
@@ -192,6 +203,8 @@ class LayerPoolKey(PoolKey):
                 self.key_metadata.kv_cache_group_id,
                 self.key_metadata.cache_role,
                 self.key_metadata.cache_family,
+                self.key_metadata.cache_namespace,
+                self.key_metadata.block_size,
                 self.chunk_hash,
                 self.layer_id,
             )
@@ -199,7 +212,7 @@ class LayerPoolKey(PoolKey):
 
     def to_string(self):
         return (
-            f"{self.key_metadata.model_name}"
+            f"{self.key_metadata.model_key()}"
             f"@dcp:{self.key_metadata.dcp_rank}"
             f"@head_or_tp_rank:{self.key_metadata.head_or_tp_rank}"
             f"@group:{self.key_metadata.kv_cache_group_id}"
@@ -372,7 +385,7 @@ class ChunkedTokenDatabase:
         if prefix is None:
             group_metadata = self.metadata[kv_cache_group_id]
             prefix = (
-                f"{group_metadata.model_name}"
+                f"{group_metadata.model_key()}"
                 f"@dcp:{group_metadata.dcp_rank}"
                 f"@head_or_tp_rank:{group_metadata.head_or_tp_rank}"
                 f"@pp_rank:{group_metadata.pp_rank}"
@@ -434,6 +447,8 @@ class ChunkedTokenDatabase:
                 kv_cache_group_id=kv_cache_group_id,
                 cache_role=cache_role,
                 cache_family=cache_family,
+                cache_namespace=group_metadata.cache_namespace,
+                block_size=group_metadata.block_size,
             ),
             chunk_hash,
         )

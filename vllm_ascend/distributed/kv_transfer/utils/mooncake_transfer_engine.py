@@ -7,6 +7,22 @@ class GlobalTE:
         self.is_register_buffer: bool = False
         self.transfer_engine_lock = threading.Lock()
         self.register_buffer_lock = threading.Lock()
+        self._pd_buffer_owners: dict[str, object] = {}
+
+    def retain_pd_buffer_owner(self, owner: object, *, role: str) -> None:
+        """Keep registered PD allocations alive until the worker process exits.
+
+        The global engine registers one KV pool per process. Replacing a live
+        pool cannot establish DMA quiescence; restart the worker instead.
+        Two fixed ownership slots cover KV storage and consumer staging.
+        """
+        if role not in ("kv", "staging"):
+            raise ValueError("Unknown PD buffer ownership role")
+        with self.register_buffer_lock:
+            previous = self._pd_buffer_owners.get(role)
+            if previous is not None and previous is not owner:
+                raise RuntimeError("Replacing registered PD buffers requires a worker process restart")
+            self._pd_buffer_owners[role] = owner
 
     def get_transfer_engine(self, hostname: str, device_name: str | None):
         if self.transfer_engine is None:

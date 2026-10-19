@@ -14,6 +14,7 @@ from vllm.logger import logger
 from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.layerwise_keys import LayerwiseKeyBuilder
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.cache_namespace import build_cache_namespace
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     ReqMeta,
     block_hash_to_str,
@@ -40,6 +41,7 @@ def bind_layerwise_keys(
     validate_pp_groups(kv_cache_config, parallel)
     namespace = layerwise_topology_namespace(vllm_config, kv_cache_config)
     pp_size = parallel.pipeline_parallel_size
+    block_sizes = tuple(grouped_block_size)
     if pp_size > 1:
         logger.info(
             "Mooncake PP namespace=%s rank=%d pp_size=%d config_block_size=%s group_block_sizes=%s",
@@ -52,8 +54,9 @@ def bind_layerwise_keys(
             else [],
         )
     if use_hybrid:
-        layout = hybrid_layout_id(kv_cache_config, parallel.tensor_parallel_size, namespace=namespace)
-        block_sizes = tuple(grouped_block_size)
+        layout = hybrid_layout_id(
+            kv_cache_config, parallel.tensor_parallel_size, namespace=namespace, projected_groups=pp_size > 1
+        )
 
         def make_key(group: int, block_hash: str, head: int, stage: int) -> str:
             return hybrid_block_key(
@@ -69,7 +72,13 @@ def bind_layerwise_keys(
         return LayerwiseKeyBuilder(make_key, pp_size)
 
     def make_single_group_key(group: int, block_hash: str, head: int, stage: int) -> str:
-        return make_block_key(model_name, block_hash, head, namespace=namespace, pp_rank=stage)
+        return make_block_key(
+            model_name,
+            block_hash,
+            head,
+            namespace=f"{namespace}@block_size:{block_sizes[group]}",
+            pp_rank=stage,
+        )
 
     return LayerwiseKeyBuilder(make_single_group_key, pp_size)
 
@@ -117,8 +126,9 @@ def layerwise_topology_namespace(vllm_config: Any, kv_cache_config: Any = None) 
     hash: the scheduler and every stage must derive the same namespace.
     """
     parallel = vllm_config.parallel_config
+    cache_namespace = build_cache_namespace(vllm_config)
     if parallel.pipeline_parallel_size == 1:
-        return ""
+        return cache_namespace
     model = vllm_config.model_config
     partitions = []
     previous_end = 0
@@ -145,6 +155,7 @@ def layerwise_topology_namespace(vllm_config: Any, kv_cache_config: Any = None) 
         )
     speculative = vllm_config.speculative_config
     identity = (
+        cache_namespace,
         parallel.tensor_parallel_size,
         partitions,
         model.compute_hash(),
@@ -154,7 +165,7 @@ def layerwise_topology_namespace(vllm_config: Any, kv_cache_config: Any = None) 
         speculative.compute_hash() if speculative is not None else None,
     )
     digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
-    return f"mooncake_pp_v3:{digest}"
+    return f"mooncake_pp_v4:{digest}"
 
 
 def validate_pp_groups(kv_cache_config: Any, parallel_config: Any) -> None:
@@ -212,7 +223,7 @@ def group_block_size_signature(group) -> tuple[int, ...]:
     return tuple(sorted({int(sub.block_size) for sub in specs}))
 
 
-def hybrid_layout_id(kv_cache_config, tp_size: int = 1, *, namespace: str = "") -> str:
+def hybrid_layout_id(kv_cache_config, tp_size: int = 1, *, namespace: str = "", projected_groups: bool = False) -> str:
     """Namespace every pool key, and must agree across processes.
 
     Only representation-independent fields participate. Hashing the spec
@@ -231,7 +242,7 @@ def hybrid_layout_id(kv_cache_config, tp_size: int = 1, *, namespace: str = "") 
     for group in kv_cache_config.kv_cache_groups:
         # PP projects global groups onto each stage. The model/partition hash
         # supplies the global identity; local membership must not split it.
-        groups.append(([] if namespace else sorted(group.layer_names), group_block_size_signature(group)))
+        groups.append(([] if projected_groups else sorted(group.layer_names), group_block_size_signature(group)))
     # No default= fallback on purpose: anything non-serializable here would have
     # to come from a repr that can differ per process, which is exactly the bug
     # this hash must never reacquire. Fail loudly instead.

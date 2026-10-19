@@ -30,6 +30,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
     validate_layerwise_runtime,
     validate_layerwise_topology,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.cache_namespace import build_cache_namespace
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator import AscendStoreCoordinator
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.dspark_prefix_cache import DSparkPrefixKeys
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
@@ -265,6 +266,7 @@ class KVPoolScheduler:
                     vllm_config.kv_transfer_config.kv_connector_extra_config,
                 ).has_layer_reuse
         self.model_name = model_config.model.split("/")[-1]
+        self.cache_namespace = build_cache_namespace(vllm_config)
 
         self.client: LookupKeyClient | None = None
         # PERF-TUNE(3): cross-request block hit cache for the scheduler-side
@@ -321,6 +323,8 @@ class KVPoolScheduler:
                                 pp_rank,
                                 kv_cache_group_id=kv_cache_group_id,
                                 cache_family=cache_family,
+                                cache_namespace=self.cache_namespace,
+                                block_size=self.grouped_block_size[kv_cache_group_id],
                             ),
                             chunk_hash,
                         )
