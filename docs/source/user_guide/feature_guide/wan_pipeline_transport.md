@@ -31,6 +31,9 @@ Ascend configuration keys in the same JSON object. Enable it consistently on
 all members of each PP group. `pipeline_parallel_size` must exceed one; the
 external-launcher path is not supported by this adapter.
 
+For compute chunk planning, network fragmentation, and a shared exit across
+workers/hosts, see [WAN PP joint scheduling](wan_pipeline_joint_scheduling.md).
+
 | Field | Meaning |
 | --- | --- |
 | `enabled` | Defaults to false. |
@@ -127,8 +130,9 @@ automatically redirected through the new transport. Their cache/state
 semantics remain with those connectors. The extension points are explicit:
 
 - `CreditBudget` and its reservations can be shared within a process with a
-  future PD/EC adapter. Source completion and persistent D KV ownership must
-  still use different reservations. This is not yet cross-process NIC QoS.
+  future PD/EC adapter. The optional joint-scheduling egress service adds
+  cross-process/host network admission. Source completion and persistent D KV
+  ownership must still use different reservations; neither is hardware NIC QoS.
 - `try_reserve()` is a nonblocking admission interface. `receive()` tickets
   expose `ready()` for future data-ready scheduling. The current worker uses
   blocking bounded admission and preserves its batch order.
@@ -182,3 +186,6 @@ occupancy, graph-buffer reuse and correct shutdown. For a RoCE deployment,
 measure TTFT/token-gap tails, useful throughput and NPU idle time alongside
 actual network counters. Network impairment must affect the real RDMA path.
 No performance improvement is claimed from the CPU experiments.
+
+The fragmented transport uses protocol version 2. Upgrade all members of a PP
+group together; incompatible generations/versions fail at the handshake.

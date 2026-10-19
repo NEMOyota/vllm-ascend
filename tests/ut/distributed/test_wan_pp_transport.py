@@ -287,7 +287,7 @@ def _run_partial_publication_failure(_rank, _init_method):
                 self.greeted = True
                 return {
                     "kind": "hello",
-                    "version": 1,
+                    "version": 2,
                     "epoch": "test-receiver",
                     "gather_size": 1,
                     "device_type": "cpu",
@@ -295,6 +295,7 @@ def _run_partial_publication_failure(_rank, _init_method):
                     "slot_bytes": config.slot_bytes,
                     "max_inflight_bytes": config.max_inflight_bytes,
                     "max_metadata_bytes": config.max_metadata_bytes,
+                    "max_fragment_bytes": config.slot_bytes,
                 }
             assert stop_backend.wait(_SIGNAL_TIMEOUT_S)
             raise OSError("test backend stopped")

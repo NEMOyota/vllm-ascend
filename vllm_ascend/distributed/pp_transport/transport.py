@@ -24,8 +24,9 @@ from .buffers import DeviceRuntime, FrameLayout, TensorBufferPool
 from .config import WanPPConfig
 from .credits import CreditBudget, CreditReservation
 
-_PROTOCOL_VERSION = 1
+_PROTOCOL_VERSION = 2
 _SHARED_BUDGET_POLL_S = 0.01
+_EGRESS_POLL_S = 0.001
 
 
 class PipelineTransportError(RuntimeError):
@@ -39,6 +40,17 @@ class _IncomingFrame:
     layout: FrameLayout
     batch_id: int | str | None
     released: bool = False
+
+
+@dataclass
+class _OutgoingFragment:
+    frame: "SendReservation"
+    offset: int
+    size: int
+    last: bool
+    credit: CreditReservation
+    handles: list[Any]
+    egress_lease: Any = None
 
 
 class SendReservation:
@@ -65,9 +77,10 @@ class SendReservation:
         self.handles: list[Any] = []
         self.source_done = False
         self.consumer_done = False
+        self.traffic = "bulk"
 
-    def publish(self, tensors: dict[str, Any], *, batch_id: int | str | None = None) -> None:
-        self._transport._publish(self, tensors, batch_id)
+    def publish(self, tensors: dict[str, Any], *, batch_id: int | str | None = None, traffic: str = "auto") -> None:
+        self._transport._publish(self, tensors, batch_id, traffic)
 
     def cancel(self) -> None:
         self._transport._cancel(self)
@@ -124,8 +137,9 @@ class WanPPTransport:
 
     ``backend`` is an adapter seam for HIXL/HCOMM. It must preserve the same
     completion/ordering contract; replacing it does not add PD state semantics.
-    ``budget`` can coordinate local PP/PD outstanding work. Cross-process NIC
-    arbitration and D-side persistent KV reservations remain separate layers.
+    ``budget`` coordinates local staging capacity. The optional egress service
+    separately arbitrates network fragments across processes and hosts; it
+    must not be used as a D-side persistent KV reservation.
     """
 
     def __init__(
@@ -160,6 +174,27 @@ class WanPPTransport:
         rank = group.rank_in_group
         self._previous = None if rank == 0 else group.ranks[rank - 1]
         self._next = None if rank == group.world_size - 1 else group.ranks[rank + 1]
+        joint = config.joint_config
+        self._fragment_bytes = min(config.slot_bytes, joint.fragment_bytes) if joint.enabled else config.slot_bytes
+        self._network_window_fragments = joint.window_fragments if joint.enabled else config.num_slots
+        self._network_window_bytes = joint.window_bytes if joint.enabled else config.max_inflight_bytes
+        self._network_budget = CreditBudget(self._network_window_fragments, self._network_window_bytes)
+        self._remote_fragment_bytes = self._fragment_bytes
+        self._egress = None
+        endpoint = joint.egress_rank_endpoints.get(group.ranks[rank], joint.egress_endpoint)
+        if joint.enabled and endpoint and self._next is not None:
+            from .egress_service import EgressClient
+
+            self._egress = EgressClient(
+                endpoint,
+                flow_id=f"pp-{group.ranks[rank]}-{self._next}-{uuid4().hex}",
+                timeout_s=joint.egress_rpc_timeout_s,
+            )
+            limits = self._egress.limits
+            limit = min(limits.max_bytes, limits.burst_bytes) if limits.rate_bytes_per_s else limits.max_bytes
+            # The shared physical bottleneck may be smaller than the local
+            # window. Negotiate a fragment that fits both, never a whole frame.
+            self._fragment_bytes = min(self._fragment_bytes, limit)
         self._condition = Condition()
         self._publication_lock = Lock()
         self._error: BaseException | None = None
@@ -173,6 +208,7 @@ class WanPPTransport:
         self._remote_budget: CreditBudget | None = None
         self._reservations: dict[int, SendReservation] = {}
         self._outbound: dict[int, SendReservation] = {}
+        self._fragments: dict[tuple[int, int], _OutgoingFragment] = {}
         self._incoming: deque[_IncomingFrame] = deque()
         self._receive_leases: dict[int, _IncomingFrame] = {}
         self._active_ticket: ReceiveTicket | None = None
@@ -186,10 +222,15 @@ class WanPPTransport:
         self._consumed_frames = 0
         self._sent_wire_bytes = 0
         self._credit_wait_seconds = 0.0
+        self._network_wait_seconds = 0.0
+        self._sent_fragments = 0
+        self._completed_fragments = 0
+        self._peak_network_bytes = 0
+        self._peak_network_fragments = 0
         self._input_closed = self._previous is None
         self._output_closed = self._next is None
         self._send_queue: Queue[SendReservation | None] = Queue(config.num_slots + 1)
-        self._completion_queue: Queue[SendReservation | None] = Queue(config.num_slots + 1)
+        self._completion_queue: Queue[_OutgoingFragment | None] = Queue(self._network_window_fragments + 1)
         self._consume_queue: Queue[tuple[_IncomingFrame, Any] | None] = Queue(config.num_slots + 1)
         self._send_stream = self._runtime.new_stream()
         self._receive_stream = self._runtime.new_stream()
@@ -242,6 +283,10 @@ class WanPPTransport:
             self._condition.notify_all()
         # No timeout or logical cancellation proves that a posted DMA stopped.
         # The worker retains this transport/pools until backend teardown.
+        if first and self._egress is not None:
+            # The coordinator keeps uncertain grants on disconnect. Pending
+            # requests alone may be cancelled; they have not touched the NIC.
+            self._egress.fail(str(error))
         if first and self._on_fatal is not None:
             self._on_fatal(error)
 
@@ -324,29 +369,33 @@ class WanPPTransport:
             del self._reservations[id(reservation)]
             self._condition.notify_all()
 
-    def send(self, tensors: dict[str, Any], *, batch_id: int | str | None = None) -> None:
+    def send(self, tensors: dict[str, Any], *, batch_id: int | str | None = None, traffic: str = "auto") -> None:
         layout = FrameLayout.from_tensors(tensors, self._gather_size, self._gather_rank)
         reservation = self.reserve(layout.logical_bytes)
         try:
-            reservation.publish(tensors, batch_id=batch_id)
+            reservation.publish(tensors, batch_id=batch_id, traffic=traffic)
         except Exception:
             if reservation.state == "reserved":
                 reservation.cancel()
             raise
 
-    def _publish(self, reservation: SendReservation, tensors: dict[str, Any], batch_id) -> None:
+    def _publish(self, reservation: SendReservation, tensors: dict[str, Any], batch_id, traffic: str) -> None:
         # Packing runs outside the condition so completion owners can progress.
         # Serialize publishers across that interval to keep header/outbox
         # sequences identical, including for future scheduler-driven callers.
         with self._publication_lock:
-            self._prepare_publication(reservation, tensors, batch_id)
+            self._prepare_publication(reservation, tensors, batch_id, traffic)
 
-    def _prepare_publication(self, reservation: SendReservation, tensors: dict[str, Any], batch_id) -> None:
+    def _prepare_publication(
+        self, reservation: SendReservation, tensors: dict[str, Any], batch_id, traffic: str
+    ) -> None:
         layout = FrameLayout.from_tensors(tensors, self._gather_size, self._gather_rank)
         if layout.logical_bytes > reservation.local.size:
             raise ValueError("Frame exceeds its reservation; increase slot_bytes or reduce the scheduled batch")
         if batch_id is not None and (isinstance(batch_id, bool) or not isinstance(batch_id, (str, int))):
             raise ValueError("batch_id must be an integer, string or None")
+        if traffic not in ("auto", "latency", "bulk"):
+            raise ValueError("PP traffic must be auto, latency or bulk")
         with self._condition:
             self.check_error()
             if self._closing or reservation.state != "reserved" or reservation._transport is not self:
@@ -358,6 +407,7 @@ class WanPPTransport:
                 "sequence": self._next_sequence,
                 "batch_id": batch_id,
                 "gather_size": self._gather_size,
+                "fragment_bytes": min(self._fragment_bytes, self._remote_fragment_bytes),
                 "layout": layout.to_dict(),
             }
             # Own the metadata as well as tensors before returning to a caller
@@ -374,6 +424,12 @@ class WanPPTransport:
             with self._condition:
                 self.check_error()
                 reservation.layout = layout
+                # Size classification is not a model-specific decode detector.
+                reservation.traffic = (
+                    ("latency" if layout.wire_bytes <= header["fragment_bytes"] else "bulk")
+                    if traffic == "auto"
+                    else traffic
+                )
                 reservation.header = header
                 reservation.sequence = self._next_sequence
                 reservation.local.shrink(layout.logical_bytes)
@@ -399,15 +455,27 @@ class WanPPTransport:
             self._backend.publish(frame.header, self._next)
             with self._runtime.context(self._send_stream):
                 self._runtime.wait_event(frame.ready, self._send_stream)
-                frame.handles = self._backend.submit_send(
-                    self._send_pool.buffer(frame.slot, frame.layout.wire_bytes), self._next
-                )
-            with self._condition:
-                frame.state = "published"
-                self._published_frames += 1
-                self._sent_wire_bytes += frame.layout.wire_bytes
-                self._condition.notify_all()
-            self._completion_queue.put_nowait(frame)
+            width = frame.header["fragment_bytes"]
+            # A zero-byte frame still needs local retirement and peer consume
+            # credit, but acquires no physical egress bytes.
+            for offset in range(0, max(1, frame.layout.wire_bytes), width):
+                size = min(width, frame.layout.wire_bytes - offset)
+                fragment = self._reserve_fragment(frame, offset, size)
+                # Keep handles/leases owned even if a backend partially posts
+                # before raising. The channel's failure path never refunds it.
+                with self._runtime.context(self._send_stream):
+                    fragment.handles = self._backend.submit_send(
+                        self._send_pool.buffer(frame.slot, frame.layout.wire_bytes)[offset : offset + size], self._next
+                    )
+                with self._condition:
+                    self.check_error()
+                    self._sent_wire_bytes += size
+                    self._sent_fragments += int(size > 0)
+                    if fragment.last:
+                        frame.state = "published"
+                        self._published_frames += 1
+                    self._condition.notify_all()
+                self._completion_queue.put_nowait(fragment)
         self._backend.publish(
             {"kind": "close", "version": _PROTOCOL_VERSION, "epoch": self._send_epoch, "sequence": self._next_sequence},
             self._next,
@@ -415,19 +483,58 @@ class WanPPTransport:
         self._completion_queue.put_nowait(None)
 
     def _completion_loop(self) -> None:
-        while (frame := self._completion_queue.get()) is not None:
+        while (fragment := self._completion_queue.get()) is not None:
             self.check_error()
-            self._runtime.finish(frame.handles, self._completion_stream)
+            self._runtime.finish(fragment.handles, self._completion_stream)
+            if fragment.egress_lease is not None:
+                fragment.egress_lease.release()
             with self._condition:
                 self.check_error()
-                frame.source_done = True
-                frame.local.release()
-                if frame.shared is not None:
-                    frame.shared.release()
-                self._send_pool.release(frame.slot)
-                self._sent_frames += 1
-                self._retire_outbound(frame)
+                frame = fragment.frame
+                fragment.credit.release()
+                self._completed_fragments += int(fragment.size > 0)
+                del self._fragments[(frame.sequence, fragment.offset)]
+                if fragment.last:
+                    # One FIFO completion owner: the last fragment proves all
+                    # earlier fragments stopped reading this source snapshot.
+                    frame.source_done = True
+                    frame.local.release()
+                    if frame.shared is not None:
+                        frame.shared.release()
+                    self._send_pool.release(frame.slot)
+                    self._sent_frames += 1
+                    self._retire_outbound(frame)
                 self._condition.notify_all()
+
+    def _reserve_fragment(self, frame: SendReservation, offset: int, size: int) -> _OutgoingFragment:
+        start = monotonic()
+        deadline = start + self.config.timeout_s
+        with self._condition:
+            self.check_error()
+            while (credit := self._network_budget.try_reserve(size)) is None:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Timed out waiting for PP network window completion")
+                self._condition.wait(remaining)
+                self.check_error()
+            fragment = _OutgoingFragment(frame, offset, size, offset + size == frame.layout.wire_bytes, credit, [])
+            self._fragments[(frame.sequence, offset)] = fragment
+            count, nbytes = self._network_budget.usage()
+            self._peak_network_fragments = max(self._peak_network_fragments, count)
+            self._peak_network_bytes = max(self._peak_network_bytes, nbytes)
+        if self._egress is not None and size:
+            # Each RPC returns promptly. A queued pacing/fairness request is
+            # not a submitted transfer and has no DMA completion timeout. The
+            # transport still checks cancellation/failure while it is pending.
+            while (lease := self._egress.try_acquire(size, traffic=frame.traffic)) is None:
+                with self._condition:
+                    self.check_error()
+                    self._condition.wait(_EGRESS_POLL_S)
+            fragment.egress_lease = lease
+        with self._condition:
+            self.check_error()
+            self._network_wait_seconds += monotonic() - start
+        return fragment
 
     def _retire_outbound(self, frame: SendReservation) -> None:
         if frame.source_done and frame.consumer_done:
@@ -447,15 +554,18 @@ class WanPPTransport:
             raise PipelineTransportError("Incompatible PP receiver capabilities")
         slots, size, limit = hello["num_slots"], hello["slot_bytes"], hello["max_inflight_bytes"]
         metadata_limit = hello["max_metadata_bytes"]
+        fragment_limit = hello["max_fragment_bytes"]
         if (
-            not all(type(value) is int and value > 0 for value in (slots, size, limit, metadata_limit))
+            not all(type(value) is int and value > 0 for value in (slots, size, limit, metadata_limit, fragment_limit))
             or not size <= limit <= slots * size
+            or fragment_limit > size
         ):
             raise PipelineTransportError("Invalid receiver credit grant")
         with self._condition:
             self._send_epoch = hello["epoch"]
             self._remote_slot_bytes = size
             self._remote_metadata_bytes = metadata_limit
+            self._remote_fragment_bytes = fragment_limit
             self._remote_budget = CreditBudget(slots, limit)
             self._condition.notify_all()
         while True:
@@ -497,6 +607,7 @@ class WanPPTransport:
                 "slot_bytes": self.config.slot_bytes,
                 "max_inflight_bytes": self.config.max_inflight_bytes,
                 "max_metadata_bytes": self.config.max_metadata_bytes,
+                "max_fragment_bytes": self._fragment_bytes,
                 "gather_size": self._gather_size,
                 "device_type": self._device.type,
             },
@@ -523,11 +634,14 @@ class WanPPTransport:
             if header.get("kind") != "frame" or header.get("gather_size") != self._gather_size:
                 raise PipelineTransportError("Invalid PP frame or TP layout")
             layout = FrameLayout.from_dict(header["layout"])
+            fragment_bytes = header.get("fragment_bytes")
             if (
                 layout.logical_bytes > self.config.slot_bytes
                 or layout.wire_bytes > layout.logical_bytes
                 or layout.gather_size != self._gather_size
                 or layout.device_kind not in (self._device.type, "none")
+                or type(fragment_bytes) is not int
+                or not 0 < fragment_bytes <= self._fragment_bytes
             ):
                 raise PipelineTransportError("PP frame exceeds reserved receiver capacity")
             with self._condition:
@@ -542,9 +656,7 @@ class WanPPTransport:
                 self._receive_leases[frame.sequence] = frame
                 self._receive_bytes += layout.logical_bytes
                 self._received_sequence += 1
-            with self._runtime.context(self._receive_stream):
-                handles = self._backend.submit_recv(self._recv_pool.buffer(slot, layout.wire_bytes), self._previous)
-                self._runtime.finish(handles, self._receive_stream)
+            self._receive_fragments(slot, layout.wire_bytes, fragment_bytes)
             with self._condition:
                 self.check_error()
                 self._received_frames += 1
@@ -553,6 +665,31 @@ class WanPPTransport:
                 else:
                     self._incoming.append(frame)
                 self._condition.notify_all()
+
+    def _receive_fragments(self, slot: int, wire_bytes: int, width: int) -> None:
+        # Network pieces may finish independently, but no partial tensor frame
+        # becomes visible to the model. The full-frame lease remains held.
+        pending: deque[tuple[list[Any], int]] = deque()
+        pending_bytes = 0
+        with self._runtime.context(self._receive_stream):
+            for offset in range(0, wire_bytes, width):
+                size = min(width, wire_bytes - offset)
+                while (
+                    len(pending) >= self._network_window_fragments or pending_bytes + size > self._network_window_bytes
+                ):
+                    handles, completed_size = pending.popleft()
+                    self._runtime.finish(handles, self._receive_stream)
+                    pending_bytes -= completed_size
+                    self.check_error()
+                handles = self._backend.submit_recv(
+                    self._recv_pool.buffer(slot, wire_bytes)[offset : offset + size], self._previous
+                )
+                pending.append((handles, size))
+                pending_bytes += size
+            while pending:
+                handles, _ = pending.popleft()
+                self._runtime.finish(handles, self._receive_stream)
+                self.check_error()
 
     def receive(self, *, expected_batch_id: int | str | None = None) -> ReceiveTicket:
         with self._condition:
@@ -668,6 +805,8 @@ class WanPPTransport:
             if thread.is_alive():
                 self.fail(TimeoutError("PP progress owner did not shut down"))
                 self.check_error()
+        if self._egress is not None:
+            self._egress.close()
         with self._condition:
             self._closed = True
 
@@ -675,6 +814,7 @@ class WanPPTransport:
         with self._condition:
             local_count, local_bytes = self._local_budget.usage()
             remote_count, remote_bytes = (0, 0) if self._remote_budget is None else self._remote_budget.usage()
+            network_count, network_bytes = self._network_budget.usage()
             return {
                 "reserved_send_frames": local_count,
                 "reserved_send_bytes": local_bytes,
@@ -688,6 +828,14 @@ class WanPPTransport:
                 "consumed_frames": self._consumed_frames,
                 "sent_wire_bytes": self._sent_wire_bytes,
                 "credit_wait_seconds": self._credit_wait_seconds,
+                "network_wait_seconds": self._network_wait_seconds,
+                "network_inflight_fragments": network_count,
+                "network_inflight_bytes": network_bytes,
+                "peak_network_fragments": self._peak_network_fragments,
+                "peak_network_bytes": self._peak_network_bytes,
+                "sent_fragments": self._sent_fragments,
+                "completed_fragments": self._completed_fragments,
+                "effective_fragment_bytes": min(self._fragment_bytes, self._remote_fragment_bytes),
                 "pool_bytes": self.reserved_memory_bytes,
                 "failed": self._error is not None,
             }

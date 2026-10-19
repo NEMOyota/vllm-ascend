@@ -1426,6 +1426,12 @@ def _setup_worker_and_scheduler(
 
     _downgrade_swa_bounded_replay(vllm_config, ascend_config)
 
+    if ascend_config.wan_pp_config.joint_config.enabled:
+        from vllm_ascend.distributed.pp_transport.planner import apply_wan_pp_compute_budget
+
+        plan = apply_wan_pp_compute_budget(vllm_config, ascend_config.wan_pp_config)
+        logger.info("WAN PP static compute/communication plan: %s", plan)
+
 
 def _swa_bounded_replay_unsupported_mode(ascend_config) -> str | None:
     """Name the Ascend mode that cannot honor SWA bounded replay.
