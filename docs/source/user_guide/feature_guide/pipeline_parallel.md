@@ -449,6 +449,7 @@ adjusts chunk sizes using measured execution time to reduce stage idle time.
 
 ## Related Documentation
 
+- [Bounded WAN Pipeline Transport](wan_pipeline_transport.md)
 - [Supported Models](../support_matrix/supported_models.md)
 - [Ray Distributed](../../tutorials/features/ray.md)
 - [Dynamic Chunked Pipeline Parallel](dynamic_chunk_pipeline_parallel.md)

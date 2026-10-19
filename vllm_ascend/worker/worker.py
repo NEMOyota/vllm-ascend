@@ -23,7 +23,7 @@ import inspect
 import logging
 from contextlib import AbstractContextManager, nullcontext
 from types import NoneType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -111,6 +111,10 @@ from vllm_ascend.utils import (
     setup_ascend_local_comm_res,
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+from vllm_ascend.worker.pp_transport import execute_with_wan_pp
+
+if TYPE_CHECKING:
+    from vllm_ascend.distributed.pp_transport import WanPPTransport
 
 torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
 from torch._dynamo.variables import TorchInGraphFunctionVariable  # noqa: E402
@@ -197,6 +201,8 @@ class NPUWorker(WorkerBase):
         self.use_v2_model_runner = self.vllm_config.use_v2_model_runner
         self._kvpp_cache_allocation_plan: KVPPPhysicalCachePlan | None = None
         self._pp_send_work: list[Handle] = []
+        self._wan_pp_transport: WanPPTransport | None = None
+        self._wan_pp_batch_id = 0
 
         ascend_compilation_config = get_ascend_config().ascend_compilation_config
         if ascend_compilation_config.enable_npugraph_ex and ascend_compilation_config.enable_static_kernel:
@@ -249,6 +255,8 @@ class NPUWorker(WorkerBase):
                     return
 
     def sleep(self, level: int = 1) -> None:
+        if transport := getattr(self, "_wan_pp_transport", None):
+            transport.drain()
         free_bytes_before_sleep = torch.npu.mem_get_info()[0]
         # Level-1 only offloads the weights pool. Persistent metadata such as
         # the DSA Hadamard matrix is allocated outside the kv_cache pool, so it
@@ -336,6 +344,8 @@ class NPUWorker(WorkerBase):
 
         self._check_nz_disabled()
 
+        if transport := getattr(self, "_wan_pp_transport", None):
+            transport.drain()
         assert self.weight_transfer_engine is not None
         self.weight_transfer_engine.start_weight_update()
         self._weight_update_active = True
@@ -368,6 +378,8 @@ class NPUWorker(WorkerBase):
         self._weight_update_active = False
 
     def shutdown(self) -> None:
+        if transport := getattr(self, "_wan_pp_transport", None):
+            transport.close()
         state = getattr(getattr(self, "model_runner", None), "eplb_state", None)
         if isinstance(state, AscendEplbState):
             state.close()
@@ -515,6 +527,22 @@ class NPUWorker(WorkerBase):
         else:
             self.model_runner = NPUModelRunner(self.vllm_config, self.device)
 
+        wan_pp_config = get_ascend_config().wan_pp_config
+        if wan_pp_config.enabled:
+            from vllm_ascend.distributed.pp_transport import WanPPTransport
+
+            wan_pp_config.validate_parallel_config(self.parallel_config)
+            self._wan_pp_transport = WanPPTransport(
+                get_pp_group(),
+                wan_pp_config,
+                all_gather_group=None if enable_sp() else get_tp_group(),
+            )
+            logger.info(
+                "WAN PP staging pools reserve %.2f GiB on rank %d.",
+                self._wan_pp_transport.reserved_memory_bytes / GiB_bytes,
+                self.rank,
+            )
+
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
@@ -562,6 +590,15 @@ class NPUWorker(WorkerBase):
             return available_bytes
         num_blocks = plan.get_num_blocks(available_bytes)
         return num_blocks * sum(spec.page_size_bytes for spec in plan.logical_cache_spec.values())
+
+    def _wan_pp_reserved_memory_bytes(self) -> int:
+        transport = getattr(self, "_wan_pp_transport", None)
+        return transport.reserved_memory_bytes if transport is not None else 0
+
+    def get_wan_pp_stats(self) -> dict[str, int | float | bool]:
+        """Per-rank transport counters, available through executor collective RPC."""
+        transport = getattr(self, "_wan_pp_transport", None)
+        return {} if transport is None else transport.stats()
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
@@ -613,8 +650,13 @@ class NPUWorker(WorkerBase):
         # Override torch_peak_increase with the pre-graph-capture value to
         # avoid double-counting graph pool memory as activation memory.
         profile_result.torch_peak_increase = profile_torch_peak - profile_result.before_profile.torch_peak
+        # Staging pools predate profile_run, so they are neither model weights
+        # nor part of its measured activation increase.
         profile_result.non_kv_cache_memory = (
-            profile_result.non_torch_increase + profile_result.torch_peak_increase + profile_result.weights_memory
+            profile_result.non_torch_increase
+            + profile_result.torch_peak_increase
+            + profile_result.weights_memory
+            + self._wan_pp_reserved_memory_bytes()
         )
 
         # Save per-category memory for use in compile_or_warm_up_model() (step 5).
@@ -773,6 +815,9 @@ class NPUWorker(WorkerBase):
         if get_ascend_config().msmonitor_use_daemon:
             dp.step()
 
+        if getattr(self, "_wan_pp_transport", None) is not None:
+            return self._execute_model_with_wan_pp(scheduler_output)
+
         if self._pp_send_work:
             for handle in self._pp_send_work:
                 handle.wait()
@@ -835,7 +880,15 @@ class NPUWorker(WorkerBase):
         return output
 
     @torch.inference_mode()
+    def _execute_model_with_wan_pp(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        return execute_with_wan_pp(self, scheduler_output, get_pp_group())
+
+    @torch.inference_mode()
     def sample_tokens(self, grammar_output: "GrammarOutput") -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        if transport := getattr(self, "_wan_pp_transport", None):
+            transport.check_error()
         output = self.model_runner.sample_tokens(grammar_output)
         _attach_profiling_chunk_execution_time(
             self.model_runner.ascend_config.scheduler_config.profiling_chunk_config,
@@ -915,6 +968,7 @@ class NPUWorker(WorkerBase):
                 + self.peak_activation_memory
                 + self.non_torch_memory
                 + npugraph_memory_bytes
+                + self._wan_pp_reserved_memory_bytes()
             )
             self.npugraph_memory_bytes = npugraph_memory_bytes
             suggested_to_requested = int(self.requested_memory) - non_kv_memory - redundancy_buffer
@@ -930,6 +984,7 @@ class NPUWorker(WorkerBase):
                 f"for weights, {format_gib(self.peak_activation_memory)} GiB for peak "
                 f"activation, {format_gib(self.non_torch_memory)} GiB for non-torch "
                 f"memory, {format_gib(npugraph_memory_bytes)} GiB for NPU graph memory. "
+                f"WAN PP staging uses {format_gib(self._wan_pp_reserved_memory_bytes())} GiB. "
                 f"Replace gpu_memory_utilization with "
                 f"`--kv-cache-memory={suggested_to_requested}` "
                 f"({format_gib(suggested_to_requested)} GiB) to fit into requested "

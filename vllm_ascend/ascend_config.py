@@ -30,6 +30,7 @@ from vllm.utils.math_utils import cdiv
 
 from vllm_ascend.config_utils import config
 from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily, HardwareCapability, get_current_hardware_profile
+from vllm_ascend.distributed.pp_transport.config import WanPPConfig
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -621,6 +622,7 @@ class AscendConfig:
     xlite_graph_config: XliteGraphConfig = dataclasses.field(default_factory=lambda: XliteGraphConfig())
     finegrained_tp_config: FinegrainedTPConfig = dataclasses.field(default_factory=lambda: FinegrainedTPConfig())
     scheduler_config: SchedulerConfig = dataclasses.field(default_factory=lambda: SchedulerConfig())
+    wan_pp_config: WanPPConfig = dataclasses.field(default_factory=WanPPConfig)
     dynamic_spec_config: DynamicSpecConfig = dataclasses.field(default_factory=lambda: DynamicSpecConfig())
     # Still factory-injected: construction depends on vllm_config.
     sparse_kv_offload_config: Any = dataclasses.field(kw_only=True)
@@ -671,6 +673,7 @@ class AscendConfig:
     # the max_num_batched_tokens that sequence-parallel writeback corrected).
     def derive_and_validate(self, vllm_config: VllmConfig) -> AscendConfig:
         vc = vllm_config
+        self.wan_pp_config.validate_parallel_config(vc.parallel_config)
         engram_config = getattr(vc, "engram_config", None)
         if (
             engram_config is not None
