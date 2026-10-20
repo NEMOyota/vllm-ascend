@@ -138,3 +138,44 @@ class TestBoundLayerwiseKeys(unittest.TestCase):
         ]
         self.assertNotEqual(builders[0].make_full_key(0, "hash", 0, 0), builders[0].make_full_key(1, "hash", 0, 0))
         self.assertNotEqual(builders[0].make_full_key(1, "hash", 0, 0), builders[1].make_full_key(1, "hash", 0, 0))
+
+    def test_mooncake_namespace_matches_readers_and_writers(self):
+        for pp_size in (1, 2):
+            for num_groups in (1, 2):
+                with self.subTest(pp_size=pp_size, num_groups=num_groups):
+                    config = self.make_config(pp_size)
+                    cache = self.make_cache_config(num_groups)
+                    config.kv_transfer_config = SimpleNamespace(
+                        kv_connector_extra_config={"cache_namespace": "tenant-a/base-revision/run-1"}
+                    )
+
+                    def bind(config, cache, num_groups=num_groups):
+                        return mooncake_layerwise.bind_layerwise_keys(
+                            vllm_config=config,
+                            kv_cache_config=cache,
+                            model_name="model",
+                            use_hybrid=num_groups > 1,
+                            grouped_block_size=[16 * (group + 1) for group in range(num_groups)],
+                        )
+
+                    writer = bind(config, cache)
+                    reader = bind(deepcopy(config), deepcopy(cache))
+                    expected = [
+                        writer.make_full_key(0, "policy-salted-hash", head, stage)
+                        for stage in range(pp_size)
+                        for head in range(2)
+                    ]
+                    self.assertEqual(reader.make_hit_check_keys(0, "policy-salted-hash", 2), expected)
+                    config.kv_transfer_config.kv_connector_extra_config["cache_namespace"] = "tenant-b/run-1"
+                    self.assertNotEqual(bind(config, cache).make_hit_check_keys(0, "policy-salted-hash", 2), expected)
+                    self.assertNotEqual(reader.make_hit_check_keys(0, "next-policy-salted-hash", 2), expected)
+                    # A running connector snapshots its namespace at startup.
+                    self.assertEqual(writer.make_hit_check_keys(0, "policy-salted-hash", 2), expected)
+                    if pp_size == 1 and num_groups > 1:
+                        config.kv_transfer_config.kv_connector_extra_config["cache_namespace"] = (
+                            "tenant-a/base-revision/run-1"
+                        )
+                        cache.kv_cache_groups[0].layer_names.append("model.layers.9.kv")
+                        self.assertNotEqual(
+                            bind(config, cache).make_hit_check_keys(0, "policy-salted-hash", 2), expected
+                        )

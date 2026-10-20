@@ -44,8 +44,8 @@ The digest includes TP size, ordered group membership, and each group's page-siz
 signature. Together with the group ID, it identifies the cache group without
 duplicating the scheduler's cache-family classification in the object key. It
 prevents incompatible group layouts from reading the same objects. It is not a
-model-weight checksum or a tenant isolation mechanism: use isolated deployments
-for different weights with identical model names and cache specifications.
+model-weight checksum. Different weights with identical model names and cache
+specifications need a separate cache identity, as described below.
 
 Each key stores one block for one group and storing head/rank. Its bytes contain
 only that group's registered cache entries, ordered by physical layer and cache
@@ -64,6 +64,37 @@ For example:
 Several groups can transfer at one physical layer. A group is committed after
 its own last layer, not necessarily the model's last layer. Multiple cache
 entries at the same physical layer remain separate byte ranges.
+
+## Cache identity for RL and shared stores
+
+Set `cache_namespace` in `kv_connector_extra_config` to identify the tenant,
+base-model revision, and training run when reusing a Mooncake store:
+
+```json
+{
+  "backend": "mooncake",
+  "use_layerwise": true,
+  "cache_namespace": "tenant-a/base-checkpoint-sha256/training-run-42"
+}
+```
+
+The scheduler and workers bind a SHA-256 digest of this string into every
+Mooncake layerwise object key, including single-group, hybrid, and PP layouts.
+All producers and consumers sharing KV must use the same namespace and weights.
+The empty default retains the existing wire keys. The namespace is fixed when
+the connector starts; changing a config dictionary at runtime does not change
+the active keys. It avoids accidental key collisions but provides neither access
+control nor encryption.
+
+For in-place RL weight or adapter updates, also set the generation request's
+`cache_salt` to the committed policy version, scoped by the training run.
+vLLM includes this salt in its prefix block hashes; the connector preserves those
+hashes in both scheduler lookups and worker PUTs. A new policy must receive a new
+salt even if its LoRA ID is reused. Publish the version only after all ranks have
+loaded the update, and retain the existing request-admission barrier and local
+prefix-cache reset. A static `cache_namespace` alone does not make in-place
+weight updates safe. Old objects remain eligible for the store's normal
+eviction; a new namespace or salt does not delete them.
 
 ## Reachability and session lifetime
 

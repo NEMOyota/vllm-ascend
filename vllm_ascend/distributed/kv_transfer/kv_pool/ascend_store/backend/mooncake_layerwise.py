@@ -39,6 +39,17 @@ def bind_layerwise_keys(
     parallel = vllm_config.parallel_config
     validate_pp_groups(kv_cache_config, parallel)
     namespace = layerwise_topology_namespace(vllm_config, kv_cache_config)
+    transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    extra_config = transfer_config.kv_connector_extra_config if transfer_config is not None else {}
+    cache_namespace = extra_config.get("cache_namespace", "")
+    if not isinstance(cache_namespace, str):
+        raise ValueError("Mooncake cache_namespace must be a string")
+    if cache_namespace:
+        # Bind the same deployment identity on the scheduler and all workers.
+        # Keep it separate from the PP namespace: that namespace also controls
+        # whether hybrid_layout_id includes stage-local layer names.
+        digest = hashlib.sha256(cache_namespace.encode()).hexdigest()
+        model_name = f"{model_name}@mooncake_namespace_v1:{digest}"
     pp_size = parallel.pipeline_parallel_size
     if pp_size > 1:
         logger.info(
