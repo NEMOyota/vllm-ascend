@@ -36,6 +36,10 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.base_worker import (
     MooncakeBaseConnectorWorker,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.continuation.config import WanPDConfig
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.continuation.layer_events import (
+    LayerEventPublisher,
+    ReadinessGate,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.continuation.manifest import ContinuationManifest, fingerprint
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.continuation.progress import BoundedReadProgress, TransferRange
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.continuation.staging import StagingPool
@@ -214,9 +218,27 @@ class MooncakePullRecvingThread(threading.Thread):
                         if request_id in self._wan_requests:
                             raise ValueError("WAN PD request already owns a destination allocation")
                         self._wan_requests[request_id] = metadata
+                        gate = None
+                        try:
+                            manifest = ContinuationManifest.from_wire(
+                                metadata.continuation_manifest, self.wan_pd_config
+                            )
+                            if manifest.publication_mode == "layerwise":
+                                if not self.wan_pd_config.layerwise_publication:
+                                    raise ValueError("Receiver layerwise publication is disabled")
+                                gate = ReadinessGate(
+                                    self.wan_pd_config, manifest, metadata.remote_host, metadata.remote_port
+                                )
+                        except ValueError as exc:
+                            self._wan_completed(request_id, str(exc))
+                            continue
                         if not self._wan_progress.enqueue(
-                            request_id, lambda rid=request_id, meta=metadata: self._plan_wan_request(rid, meta)
+                            request_id,
+                            lambda rid=request_id, meta=metadata: self._plan_wan_request(rid, meta),
+                            gate=gate,
                         ):
+                            if gate is not None:
+                                gate.close()
                             self._wan_completed(request_id, "WAN PD pending capacity exhausted")
                 self._wan_wakeup.set()
                 return
@@ -455,28 +477,34 @@ class MooncakePullRecvingThread(threading.Thread):
                 pp, pairs, groups_by_pp[pp_rank], remote.pcp_size, remote.dcp_size, {request_id: request}, block_cache
             )
             for (pcp_rank, tp_rank), entries in buckets.items():
-                local = _BoundedAddresses(config.max_manifest_ranges - len(ranges))
-                source = _BoundedAddresses(config.max_manifest_ranges - len(ranges))
-                sizes = _BoundedAddresses(config.max_manifest_ranges - len(ranges))
-                for spec_index, layers in entries.items():
-                    self._append_spec_transfer_addresses(
-                        spec_index=spec_index,
-                        remote_pcp_rank=pcp_rank,
-                        remote_tp_rank=tp_rank,
-                        remote_pcp_size=remote.pcp_size,
-                        remote_tp_size=remote.tp_size,
-                        remote_dcp_size=remote.dcp_size,
-                        transfer_entries_by_layer=layers,
-                        remote_metadata=pp,
-                        src_list=local,
-                        dst_list=source,
-                        length_list=sizes,
-                    )
                 endpoint = pp.metadata_by_pcp_rank[pcp_rank].metadata_by_tp_rank[tp_rank]
                 peer = f"{endpoint.local_ip}:{endpoint.te_rpc_port}"
-                for destination, address, size in zip(local, source, sizes, strict=True):
-                    self.staging_pool.destination(destination, size)
-                    ranges.append(TransferRange(peer, address, destination, size))
+                for spec_index, layers in entries.items():
+                    for pair, transfer_entries in layers.items():
+                        local = _BoundedAddresses(config.max_manifest_ranges - len(ranges))
+                        source = _BoundedAddresses(config.max_manifest_ranges - len(ranges))
+                        sizes = _BoundedAddresses(config.max_manifest_ranges - len(ranges))
+                        self._append_spec_transfer_addresses(
+                            spec_index=spec_index,
+                            remote_pcp_rank=pcp_rank,
+                            remote_tp_rank=tp_rank,
+                            remote_pcp_size=remote.pcp_size,
+                            remote_tp_size=remote.tp_size,
+                            remote_dcp_size=remote.dcp_size,
+                            transfer_entries_by_layer={pair: transfer_entries},
+                            remote_metadata=pp,
+                            src_list=local,
+                            dst_list=source,
+                            length_list=sizes,
+                        )
+                        layer_key = (
+                            f"{pp_rank}:{pcp_rank}:{tp_rank}/{pp.layer_names[pair[1]]}"
+                            if manifest.publication_mode == "layerwise"
+                            else ""
+                        )
+                        for destination, address, size in zip(local, source, sizes, strict=True):
+                            self.staging_pool.destination(destination, size)
+                            ranges.append(TransferRange(peer, address, destination, size, layer_key))
         return ranges
 
     def _mark_request_failed(self, request_metadata: ReqMeta) -> None:
@@ -1818,6 +1846,7 @@ class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
         super().__init__(vllm_config, engine_id, kv_cache_config)
         self._recving_thread: MooncakePullRecvingThread | None = None
         self._wan_staging_pool: StagingPool | None = None
+        self._layer_publisher: LayerEventPublisher | None = None
 
     def register_kv_caches(
         self,
@@ -1825,6 +1854,18 @@ class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
     ) -> None:
         """Register caches and start the D-side pull execution thread."""
         super().register_kv_caches(kv_caches)
+        if self.kv_transfer_config.is_kv_producer and self.wan_pd_config.layerwise_publication:
+            if not isinstance(self.xfer_handshake_metadata, MooncakeTransferMetadata):
+                raise RuntimeError("Producer publication requires registered layer metadata")
+            device = torch.npu.current_device()
+            self._layer_publisher = LayerEventPublisher(
+                self.wan_pd_config,
+                f"{self.pp_rank}:{self.pcp_rank}:{self.tp_rank}",
+                self.xfer_handshake_metadata.layer_names,
+                event_factory=self._record_layer_event,
+                initialize_thread=lambda: torch.npu.set_device(device),
+            )
+            self._layer_publisher.start()
         if self.kv_transfer_config.is_kv_consumer:
             if self.wan_pd_config.enabled:
                 if not callable(getattr(self.engine, "batch_transfer_async_read_ticket", None)):
@@ -1867,6 +1908,15 @@ class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
 
     def start_load_kv(self, metadata: MooncakeConnectorMetadata) -> None:
         """Start the pull operations described by scheduler metadata."""
+        if metadata.failed_recv and self.kv_transfer_config.is_kv_consumer:
+            assert self._recving_thread is not None
+            for request_id, block_ids in metadata.failed_recv.items():
+                if self._recving_thread.can_report_invalid_block_ids:
+                    with self._recving_thread.invalid_block_ids_lock:
+                        for group in block_ids:
+                            self._recving_thread.invalid_block_ids.update(group)
+                # No READ or device copy was posted for these reservations.
+                self._recving_thread.finished_requests.put((request_id, True))
         if not metadata.requests:
             return
         if self.kv_transfer_config.is_kv_consumer:
@@ -1879,8 +1929,37 @@ class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
             for remote_engine_id, requests in request_groups.items():
                 self._recving_thread.add_requests(remote_engine_id, requests)
 
+    @staticmethod
+    def _record_layer_event() -> Any:
+        event = torch.npu.Event()
+        event.record(torch.npu.current_stream())
+        return event
+
+    def bind_producer_publications(self, metadata: MooncakeConnectorMetadata) -> None:
+        """Establish source context before forward, including empty PP stages."""
+        if self._layer_publisher is not None:
+            self._layer_publisher.begin(metadata.producer_publications, metadata.producer_finished)
+        elif metadata.producer_publications:
+            raise RuntimeError("Producer layerwise publication is not configured")
+
+    def save_kv_layer(self, layer_name: str, *_args: Any, **_kwargs: Any) -> None:
+        if self._layer_publisher is not None:
+            self._layer_publisher.save_layer(layer_name)
+
+    def wait_for_save(self) -> None:
+        if self._layer_publisher is not None:
+            self._layer_publisher.finalize()
+
+    def shutdown(self) -> None:
+        if self._layer_publisher is not None:
+            self._layer_publisher.close()
+        # Registered buffers and outstanding READ tickets retain the existing
+        # process lifetime ownership; stopping control work is not a DMA fence.
+
     def get_transfer_results(self) -> KVConnectorTransferResults:
         """Return completed receives, including their failure status."""
+        if self._layer_publisher is not None and self._layer_publisher.failure is not None:
+            raise RuntimeError("WAN PD producer event publication failed") from self._layer_publisher.failure
         return (
             self._recving_thread.get_and_clear_finished_requests()
             if self._recving_thread is not None

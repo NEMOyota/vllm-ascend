@@ -19,6 +19,7 @@ class TransferRange:
     source: int
     destination: int
     nbytes: int
+    layer_key: str = ""
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,7 @@ class TransferChunk:
     peer: str
     pieces: tuple[ChunkPiece, ...]
     nbytes: int
+    layer_key: str = ""
 
 
 def transfer_chunks(ranges: list[TransferRange], config: WanPDConfig) -> Iterator[TransferChunk]:
@@ -43,23 +45,28 @@ def transfer_chunks(ranges: list[TransferRange], config: WanPDConfig) -> Iterato
     pieces: list[ChunkPiece] = []
     used = 0
     peer = ""
+    layer_key = ""
     for item in ranges:
         if not item.peer or min(item.source, item.destination, item.nbytes) <= 0:
             raise ValueError("WAN PD transfer contains an invalid range")
         consumed = 0
         while consumed < item.nbytes:
             if pieces and (
-                peer != item.peer or used == config.chunk_bytes or len(pieces) == config.max_descriptors_per_chunk
+                peer != item.peer
+                or layer_key != item.layer_key
+                or used == config.chunk_bytes
+                or len(pieces) == config.max_descriptors_per_chunk
             ):
-                yield TransferChunk(peer, tuple(pieces), used)
+                yield TransferChunk(peer, tuple(pieces), used, layer_key)
                 pieces, used = [], 0
             peer = item.peer
+            layer_key = item.layer_key
             size = min(item.nbytes - consumed, config.chunk_bytes - used)
             pieces.append(ChunkPiece(item.source + consumed, item.destination + consumed, size, used))
             used += size
             consumed += size
     if pieces:
-        yield TransferChunk(peer, tuple(pieces), used)
+        yield TransferChunk(peer, tuple(pieces), used, layer_key)
 
 
 @dataclass
@@ -81,6 +88,7 @@ class _Request:
     exhausted: bool = False
     flights: list[_Flight] = field(default_factory=list)
     error: str | None = None
+    gate: Any = None
 
 
 class BoundedReadProgress:
@@ -114,14 +122,14 @@ class BoundedReadProgress:
         self.fatal_error: Exception | None = None
         engine.set_managed_batch_limit(config.staging_slots)
 
-    def enqueue(self, request_id: str, planner: Callable[[], list[TransferRange]]) -> bool:
+    def enqueue(self, request_id: str, planner: Callable[[], list[TransferRange]], *, gate: Any = None) -> bool:
         with self._lock:
             if request_id in self._owned:
                 raise ValueError("WAN PD request is already pending or awaiting completion delivery")
             if len(self._owned) >= self.config.max_pending_requests:
                 return False
             self._owned.add(request_id)
-            self._pending.append(_Request(request_id, planner, self.clock() + self.config.timeout_s))
+            self._pending.append(_Request(request_id, planner, self.clock() + self.config.timeout_s, gate=gate))
             return True
 
     def retire(self, request_id: str) -> None:
@@ -183,6 +191,8 @@ class BoundedReadProgress:
         chunk = request.next_chunk
         if chunk is None or self._network_bytes + chunk.nbytes > self.config.max_inflight_bytes:
             return
+        if request.gate is not None and not request.gate.permits(chunk.layer_key):
+            return
         if self._egress_waiter not in (None, request.request_id):
             return
         slot = self.pool.acquire()
@@ -238,6 +248,11 @@ class BoundedReadProgress:
                     self._active.append(self._pending.popleft())
             for _ in range(len(self._active)):
                 request = self._active.popleft()
+                if request.error is None and request.gate is not None:
+                    try:
+                        request.gate.advance()
+                    except Exception as exc:
+                        self._fail(request, exc)
                 if request.error is None and request.chunks is None:
                     try:
                         if self.clock() >= request.deadline:
@@ -250,7 +265,10 @@ class BoundedReadProgress:
                         self._issue(request)
                     except Exception as exc:
                         self._fail(request, exc)
-                if not request.flights and (request.error is not None or request.exhausted):
+                ready = request.exhausted and (request.gate is None or request.gate.sealed)
+                if not request.flights and (request.error is not None or ready):
+                    if request.gate is not None:
+                        request.gate.close()
                     self.completed(request.request_id, request.error)
                 else:
                     self._active.append(request)

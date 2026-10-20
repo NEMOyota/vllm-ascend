@@ -154,6 +154,10 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         self.requests: dict[str, ReqMeta] = {}
         self.requests_to_send: dict[str, float] = {}
         self.reqs_in_batch: set[str] = set()
+        self.producer_publications: dict[str, dict[str, Any]] = {}
+        self.producer_finished: set[str] = set()
+        # Allocated D requests whose reservation failed before any READ.
+        self.failed_recv: dict[str, BlockIds] = {}
 
     def add_new_req(
         self,

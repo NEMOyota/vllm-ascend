@@ -126,6 +126,18 @@ def request_identity(
     params = getattr(request, "kv_transfer_params", None) or {}
     if explicit_fingerprint is None:
         explicit_fingerprint = params.get("wan_pd_input_fingerprint")
+    structured = params.get("wan_pd_input_identity")
+    if structured is not None:
+        if not config.structured_input_identity:
+            raise ValueError("Structured PD input identity is disabled")
+        from .input_identity import derive_structured_input_fingerprint
+
+        derived = derive_structured_input_fingerprint(
+            request, namespace=namespace, processor_fingerprint=config.processor_fingerprint
+        )
+        if explicit_fingerprint is not None and explicit_fingerprint != derived:
+            raise ValueError("Explicit and structured PD input fingerprints disagree")
+        explicit_fingerprint = derived
     tokens = getattr(request, "prompt_token_ids", None)
     prompt_tokens = getattr(request, "num_prompt_tokens", None)
     if prompt_tokens is None:
@@ -141,7 +153,8 @@ def request_identity(
     if salt is not None:
         _text("cache_salt", salt)
     special_input = (
-        getattr(request, "prompt_embeds", None) is not None
+        structured is not None
+        or getattr(request, "prompt_embeds", None) is not None
         or bool(getattr(request, "mm_features", None))
         or getattr(request, "lora_request", None) is not None
         or getattr(request, "prompt_is_token_ids", None) is not None
@@ -243,6 +256,8 @@ class ContinuationManifest:
     transfer_plan_fingerprint: str = ""
     prefix_hash_block_size: int = 0
     protocol_version: int = PROTOCOL_VERSION
+    reservation_fingerprint: str = ""
+    publication_mode: str = "final"
 
     def __post_init__(self) -> None:
         for name in (
@@ -256,6 +271,11 @@ class ContinuationManifest:
             _text(name, getattr(self, name))
         if type(self.protocol_version) is not int or self.protocol_version != PROTOCOL_VERSION:
             raise ValueError("Unsupported continuation manifest version")
+        _text("reservation_fingerprint", self.reservation_fingerprint, allow_empty=True)
+        if self.publication_mode not in ("final", "layerwise"):
+            raise ValueError("Unknown PD publication mode")
+        if self.publication_mode == "layerwise" and not self.reservation_fingerprint:
+            raise ValueError("Layerwise publication requires a receiver reservation")
         for name in ("prompt_tokens", "state_position", "prefix_tokens"):
             _integer(name, getattr(self, name))
         if not self.prefix_tokens <= self.state_position <= self.prompt_tokens:
@@ -282,7 +302,14 @@ class ContinuationManifest:
 
     def payload(self) -> dict[str, Any]:
         # JSON round-trip makes tuple/list representation identical on either peer.
-        return json.loads(canonical_bytes(asdict(self), max_bytes=64 * 1024 * 1024))
+        payload = asdict(self)
+        # Preserve the original final-publication wire digest when extensions
+        # are disabled. Enabled components require matching peer versions.
+        if not self.reservation_fingerprint:
+            payload.pop("reservation_fingerprint")
+        if self.publication_mode == "final":
+            payload.pop("publication_mode")
+        return json.loads(canonical_bytes(payload, max_bytes=64 * 1024 * 1024))
 
     @property
     def digest(self) -> str:

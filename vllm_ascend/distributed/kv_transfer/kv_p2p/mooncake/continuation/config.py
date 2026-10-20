@@ -5,11 +5,18 @@
 from dataclasses import dataclass, fields
 from math import isfinite
 from typing import Any
+from urllib.parse import urlsplit
 
 
 @dataclass(frozen=True)
 class WanPDConfig:
     enabled: bool = False
+    receiver_first: bool = False
+    layerwise_publication: bool = False
+    structured_input_identity: bool = False
+    reservation_callback_url: str | None = None
+    reservation_workers: int = 4
+    processor_fingerprint: str | None = None
     max_pending_requests: int = 128
     max_active_requests: int = 8
     max_retained_source_requests: int = 1024
@@ -29,9 +36,15 @@ class WanPDConfig:
     egress_endpoint: str | None = None
 
     def __post_init__(self) -> None:
-        if type(self.enabled) is not bool:
-            raise ValueError("wan_pd.enabled must be a boolean")
+        for name in ("enabled", "receiver_first", "layerwise_publication", "structured_input_identity"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"wan_pd.{name} must be a boolean")
+        if not self.enabled and (self.receiver_first or self.layerwise_publication or self.structured_input_identity):
+            raise ValueError("WAN PD components require wan_pd.enabled")
+        if self.layerwise_publication and not self.receiver_first:
+            raise ValueError("wan_pd.layerwise_publication requires receiver_first")
         limits = {
+            "reservation_workers": 128,
             "max_pending_requests": 65536,
             "max_active_requests": 65536,
             "max_retained_source_requests": 1048576,
@@ -64,6 +77,16 @@ class WanPDConfig:
             not isinstance(self.egress_endpoint, str) or not 0 < len(self.egress_endpoint) <= 4096
         ):
             raise ValueError("wan_pd.egress_endpoint must be a nonempty string or null")
+        if self.reservation_callback_url is not None:
+            if not isinstance(self.reservation_callback_url, str) or len(self.reservation_callback_url) > 4096:
+                raise ValueError("wan_pd.reservation_callback_url must be a bounded HTTP(S) URL")
+            parsed = urlsplit(self.reservation_callback_url)
+            if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.fragment:
+                raise ValueError("wan_pd.reservation_callback_url must be an absolute HTTP(S) URL")
+        if self.processor_fingerprint is not None and (
+            not isinstance(self.processor_fingerprint, str) or not 0 < len(self.processor_fingerprint) <= 4096
+        ):
+            raise ValueError("wan_pd.processor_fingerprint must be a bounded nonempty string")
 
     @classmethod
     def from_extra_config(cls, extra_config: dict[str, Any] | None) -> "WanPDConfig":

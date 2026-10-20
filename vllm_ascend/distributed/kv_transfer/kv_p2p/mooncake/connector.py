@@ -110,6 +110,12 @@ class MooncakeBaseConnector(KVConnectorBase_V1, SupportsHMA):
     # Scheduler-side methods
     ############################################################
 
+    def bind_kv_cache_manager(self, kv_cache_manager: Any) -> None:
+        super().bind_kv_cache_manager(kv_cache_manager)
+        binder = getattr(self.connector_scheduler, "bind_kv_cache_manager", None)
+        if binder is not None:
+            binder(kv_cache_manager)
+
     def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int | None, bool]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.get_num_new_matched_tokens(request, num_computed_tokens)
@@ -171,6 +177,15 @@ class MooncakeBaseConnector(KVConnectorBase_V1, SupportsHMA):
     # Worker-side methods
     ############################################################
 
+    def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
+        super().bind_connector_metadata(connector_metadata)
+        binder = getattr(self.connector_worker, "bind_producer_publications", None)
+        if self._wan_pd_config.layerwise_publication and binder is not None:
+            # Async-load runners may call start_load_kv only after forward.
+            # Set publication context now so the first layer event is retained.
+            assert isinstance(connector_metadata, MooncakeConnectorMetadata)
+            binder(connector_metadata)
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches)
@@ -199,6 +214,14 @@ class MooncakeBaseConnector(KVConnectorBase_V1, SupportsHMA):
         implementation = self.connector_scheduler or self.connector_worker
         getter = getattr(implementation, "get_wan_pd_stats", None)
         return getter() if getter is not None else {}
+
+    def shutdown(self) -> None:
+        # Stop new control work; shutdown is not a fence for remote DMA and
+        # must not free quarantined source or registered staging allocations.
+        for implementation in (self.connector_scheduler, self.connector_worker):
+            closer = getattr(implementation, "shutdown", None)
+            if closer is not None:
+                closer()
 
     @classmethod
     def build_kv_connector_stats(cls, data: dict[str, Any] | None = None) -> KVConnectorStats:
@@ -229,10 +252,16 @@ class MooncakeBaseConnector(KVConnectorBase_V1, SupportsHMA):
         attn_metadata: "AttentionMetadata",
         **kwargs: Any,
     ) -> None:
-        """MooncakeConnector does not save KV cache explicitly."""
+        if self._wan_pd_config.layerwise_publication:
+            saver = getattr(self.connector_worker, "save_kv_layer", None)
+            if saver is not None:
+                saver(layer_name, kv_layer, attn_metadata, **kwargs)
 
     def wait_for_save(self) -> None:
-        """MooncakeConnector does not save KV cache explicitly."""
+        if self._wan_pd_config.layerwise_publication:
+            finalize = getattr(self.connector_worker, "wait_for_save", None)
+            if finalize is not None:
+                finalize()
 
     def get_handshake_metadata(self) -> KVConnectorHandshakeMetadata | None:
         """Return this worker's out-of-band transfer handshake metadata."""
